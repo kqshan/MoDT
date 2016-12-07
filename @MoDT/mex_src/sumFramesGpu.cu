@@ -32,7 +32,7 @@
 #include <cuda_runtime.h>
 #include "cublas_v2.h"
 
-#include <stdio.h>
+#include <iostream>
 #include <algorithm>
 #include <utility>
 #include <memory>
@@ -84,11 +84,11 @@ __global__ void sumFrames( int const D, long const N, int const K, int const T,
     wSum += kOffset + K*frameOffset;
     // Lay out our shared memory
     int offset = 0;
-    double *spikeBuff = (double*) &S[offset];
+    double *spikeBuff = reinterpret_cast<double*> (S + offset);
     offset += D * READ_BUFF_SZ * sizeof(*spikeBuff)/sizeof(*S);
-    double *weightBuff = (double*) &S[offset];
+    double *weightBuff = reinterpret_cast<double*> (S + offset);
     offset += kPerBlk * READ_BUFF_SZ * sizeof(*weightBuff)/sizeof(*S);
-    int *spkCounts = (int*) &S[offset];
+    int *spkCounts = reinterpret_cast<int*> (S + offset);
     // Copy the spike counts into shared memory
     int const tIdx = threadIdx.x + threadIdx.y*blockDim.x;
     int const tPerBlk = blockDim.x * blockDim.y;
@@ -96,7 +96,6 @@ __global__ void sumFrames( int const D, long const N, int const K, int const T,
         spkCounts[ii] = (int) (spkLims[ii+T] - spkLims[ii] + 1);
     
     // Determine what this tread is responsible for computing
-    int const tIdx_rev = tPerBlk-tIdx-1;
     bool threadHasValidCompute = false;
     double *spkCompBuff, *wCompBuff, *outputTgt;
     int spkCompStride, outputStride;
@@ -111,20 +110,20 @@ __global__ void sumFrames( int const D, long const N, int const K, int const T,
         wCompBuff = weightBuff + READ_BUFF_SZ*k;
         outputTgt = spkSum + d + D*k;
         outputStride = D*K;
-    } else if (tIdx_rev < kCount) {
+    } else if (tIdx - D*kCount < kCount) {
         threadHasValidCompute = true;
         // Thread computes wSum(k,t) = sum(weights(:,k))
-        int k = tIdx_rev;
+        int k = tIdx - D*kCount;
         spkCompBuff = &one;
         spkCompStride = 0;
         wCompBuff = weightBuff + READ_BUFF_SZ*k;
         outputTgt = wSum + k;
         outputStride = K;
     }
-    
-    // Some useful values for determining what to do when loading data
-    int const spkLoadThreads = D * READ_BUFF_SZ;
-    int const wLoadThreads = READ_BUFF_SZ * kCount;
+    // Determine what to do when loading
+    int const loadOps_spk = D * READ_BUFF_SZ;
+    int const loadOps_w = READ_BUFF_SZ * kCount;
+    int const tIdx_2 = (tIdx + 32*((loadOps_spk+31)/32)) % tPerBlk;
     
     // Main loop over time frames
     for (int frameIdx=0; frameIdx<frameCount; frameIdx++) {
@@ -134,11 +133,11 @@ __global__ void sumFrames( int const D, long const N, int const K, int const T,
         // About 98% of the time, we can load+compute a whole buffer at a time
         while (nSpkRemain >= READ_BUFF_SZ) {
             // Load from spikes
-            for (int ldIdx=tIdx; ldIdx<spkLoadThreads; ldIdx+=tPerBlk)
+            for (int ldIdx = tIdx; ldIdx < loadOps_spk; ldIdx += tPerBlk)
                 spikeBuff[ldIdx] = spikes[ldIdx];
             spikes += D*READ_BUFF_SZ;
             // Load from weights
-            for (int ldIdx=tIdx_rev; ldIdx<wLoadThreads; ldIdx+=tPerBlk) {
+            for (int ldIdx = tIdx_2; ldIdx < loadOps_w; ldIdx += tPerBlk) {
                 int load_n = ldIdx % READ_BUFF_SZ;
                 int load_k = ldIdx / READ_BUFF_SZ;
                 weightBuff[ldIdx] = weights[load_n + N*load_k];
@@ -147,19 +146,21 @@ __global__ void sumFrames( int const D, long const N, int const K, int const T,
             // Compute spikes*weights and sum(weights)
             __syncthreads();
             if (threadHasValidCompute) {
+                double local_acc = 0;
                 for (int ii=0; ii<READ_BUFF_SZ; ii++)
-                    result_acc += spkCompBuff[spkCompStride*ii] * wCompBuff[ii];
+                    local_acc += spkCompBuff[spkCompStride*ii] * wCompBuff[ii];
+                result_acc += local_acc;
             }
             __syncthreads();
             // Advance the buffer
             nSpkRemain -= READ_BUFF_SZ;
         }
         // Load the remaining spikes
-        for (int ldIdx=tIdx; ldIdx<(D*nSpkRemain); ldIdx+=tPerBlk)
+        for (int ldIdx = tIdx; ldIdx < D*nSpkRemain; ldIdx += tPerBlk)
             spikeBuff[ldIdx] = spikes[ldIdx];
         spikes += D*nSpkRemain;
         // Load the remaining weights
-        for (int ldIdx=tIdx_rev; ldIdx<(nSpkRemain*kCount); ldIdx+=tPerBlk) {
+        for (int ldIdx = tIdx_2; ldIdx < nSpkRemain*kCount; ldIdx += tPerBlk) {
             int load_n = ldIdx % nSpkRemain;
             int load_k = ldIdx / nSpkRemain;
             weightBuff[load_n+READ_BUFF_SZ*load_k] = weights[load_n + N*load_k];
@@ -169,8 +170,10 @@ __global__ void sumFrames( int const D, long const N, int const K, int const T,
         __syncthreads();
         if (threadHasValidCompute) {
             // Compute on the partial buffer
+            double local_acc = 0;
             for (int ii=0; ii<nSpkRemain; ii++)
-                result_acc += spkCompBuff[spkCompStride*ii] * wCompBuff[ii];
+                local_acc += spkCompBuff[spkCompStride*ii] * wCompBuff[ii];
+            result_acc += local_acc;
             // Write to output
             outputTgt[outputStride*frameIdx] = result_acc;
         }
@@ -216,8 +219,8 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[])
             (mxGPUGetClassID(mgpu_Y)!=mxDOUBLE_CLASS))
         mexErrMsgIdAndTxt(errId, "Y must a 2-D double-precision gpuArray");
     size_t const *dims = mxGPUGetDimensions( mgpu_Y );
-    size_t D = dims[0];
-    size_t N = dims[1];
+    ptrdiff_t D = (ptrdiff_t) dims[0];
+    ptrdiff_t N = (ptrdiff_t) dims[1];
     double const *d_Y = (double const *) mxGPUGetDataReadOnly( mgpu_Y );
     // wzu (weights) = input 1
     mxArray const *mx_wzu = prhs[1];
@@ -230,14 +233,14 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[])
             (mxGPUGetClassID(mgpu_wzu)!=mxDOUBLE_CLASS))
         mexErrMsgIdAndTxt(errId, "wzu must a 2-D double-precision gpuArray");
     dims = mxGPUGetDimensions( mgpu_wzu );
-    size_t N_wzu = dims[0];
-    size_t K = dims[1];
+    ptrdiff_t N_wzu = (ptrdiff_t) dims[0];
+    ptrdiff_t K = (ptrdiff_t) dims[1];
     if (N_wzu != N)
         mexErrMsgIdAndTxt(errId, "wzu must be a [N x K] gpuArray");
     double const *d_wzu = (double const *) mxGPUGetDataReadOnly( mgpu_wzu );
     // fsLim (frame spike limits) = input 2
     mxArray const *mx_fsLim = prhs[2];
-    size_t T = mxGetM(mx_fsLim);
+    ptrdiff_t T = mxGetM(mx_fsLim);
     if (!mxIsDouble(mx_fsLim) || (T==0) || (mxGetN(mx_fsLim)!=2))
         mexErrMsgIdAndTxt(errId, "f_spklim must be a [T x 2] array of doubles");
     double const *fsLim = mxGetPr(mx_fsLim);
@@ -262,12 +265,12 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[])
     }
     
     // Allocate memory for the outputs
-    std::vector<size_t> dims_wzuY = {D, K, T};
+    std::vector<size_t> dims_wzuY = {(size_t)D, (size_t)K, (size_t)T};
     mxGPUArray *mgpu_wzuY = mxGPUCreateGPUArray( 3, dims_wzuY.data(), 
             mxDOUBLE_CLASS, mxREAL, MX_GPU_INITIALIZE_VALUES );
     mxGPUArrayCleanupWrapper cleanup_wzuY(mgpu_wzuY);
     double *d_wzuY = (double *) mxGPUGetData(mgpu_wzuY);
-    std::vector<size_t> dims_sumwzu = {K, T};
+    std::vector<size_t> dims_sumwzu = {(size_t)K, (size_t)T};
     mxGPUArray *mgpu_sumwzu = mxGPUCreateGPUArray( 2, dims_sumwzu.data(),
             mxDOUBLE_CLASS, mxREAL, MX_GPU_INITIALIZE_VALUES );
     mxGPUArrayCleanupWrapper cleanup_sumwzu(mgpu_sumwzu);
@@ -312,7 +315,7 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[])
             K_eff = K;
         }
         // Figure out how many threads per block
-        int nWarps = (D*K_eff+31)/32 + (K_eff+31)/32;
+        int nWarps = (D*K_eff + K_eff + 31)/32;
         dim3 threadsPerBlock(32, nWarps);
         // Figure out how many blocks in the grid
         int blocksPerDevice = prop.multiProcessorCount * (maxK/K_eff);

@@ -29,117 +29,102 @@
 #include <algorithm>
 #include <utility>
 
+
 /* CUDA kernel for computing A*diag(w)*A'
  *
  * This expects:
- *  - 1-D thread block of size [32*loadWarps + D*(D+1)]
- *  - Shared memory to hold (D+1)*64 doubles
+ *  - 1-D thread block with at least D*(D+1)/2 threads
+      (it should also have at least 32 threads)
+ *  - Shared memory to hold (D+1)*32 doubles
  *  - 1-D block grid of any size
- *
- * This kernel uses (32*loadWarps) non-computing threads to load data into
- * shared memory and D*(D+1) compute threads to compute the weighted covariance.
  *
  * Inputs:
  *    D             # rows in A, and dimension of C
  *    N             # columns in A, and entries in w
- *    loadWarps     # warps (32 threads per warp) to dedicate to loading data
  *    A             [D x N] data matrix
  *    w             [N] weight vector
  * Outputs:
  *    C             [D x D x #blocks] matrix to store the output
  */
+int const READ_BUFF_SZ = 32;
 __global__ void calcWeightedCov(
-        int const D, int const N, int const loadWarps,
-        double const * __restrict__ A, double const * __restrict__ w, 
-        double *C)
+        int const D, int const N, double const *A, double const *w, double *C)
 {
-    /* Dynamically-allocated shared memory, length = (D+1)*64
-     * This is split into 2 pages of size (32*D+32), laid out as:
-     *  [ A_page0 ; w_page0; A_page1 ; w_page1 ]
-     * In our main loop, we alternate pages so that the next load can occur
-     * while we are still computing on the previously-loaded page. */
+    // Dynamically-allocated shared memory, length = (D+1)*32
     extern __shared__ double S[];
-    double * A_buff = S;
-    int const A_buffSize = 32*D;
-    double * w_buff = S + A_buffSize;
-    int const w_buffSize = 32;
-    int const pageSize = A_buffSize + w_buffSize;
+    double *w_buff = S;                // [32 x 1] buffer for weights
+    double *A_buff = S + READ_BUFF_SZ; // [D x 32] buffer for data matrix
     
     // Figure out what this thread is supposed to be doing
-    int const loadThreads = 32 * loadWarps;
-    int const tIsLoad = (threadIdx.x < loadThreads);
-    int const tIdx = (tIsLoad) ? (threadIdx.x) : (threadIdx.x-loadThreads);
-    int ii, jj;
-    if (tIsLoad) {
-        /* Since we are loading 32 columns at a time, exactly one warp
-         * will be tasked with loading from w.
-         * ii = wIdx if this thread belongs to that warp, ii = -1 otherwise */
-        ii = ((tIdx/32)==((D+1)%loadWarps)) ? (tIdx%32) : (-1);
-    } else {
-        /* Compute threads are organized into a [D x (D+1)] array.
-         *          [ 00a  00b  01b  02b ]
-         * For D=3: [ 10a  11a  11b  12b ]
-         *          [ 20a  21a  22a  22b ]
-         * The entries marked __a will compute the covariance over
-         * even-numbered columns and __b will compute the odd columns. */
-        jj = tIdx/D;
-        ii = tIdx - D*jj;
+    int const tIdx = threadIdx.x;
+    int const nThreads = blockDim.x;
+    // Loading phase: the first 32 threads will load w, rest will do A
+    int const readOps_w = READ_BUFF_SZ; // Gonna assume nThreads > READ_BUFF_SZ
+    int const tIdx_A = (tIdx - readOps_w + nThreads) % nThreads;
+    int const readOps_A = D * READ_BUFF_SZ * sizeof(double)/sizeof(double2);
+    // Compute phase: this thread will compute C(ii,jj)
+    int ii = -1, jj = -1;
+    if (tIdx < D*(D+1)/2) {
+        ii = tIdx % D; jj = tIdx / D;
         if (jj > ii) {
-            jj--;
-            // Shift the pointers up by one column so it does the odd columns
-            A_buff += D;
-            w_buff++;
+            ii = D-1 - ii; jj = D - jj;
         }
     }
+    // And we will store the result in this local register
+    double result_acc = 0;
     
-    // Main loop: load and compute the covariance
-    int currPage = 0;       // Start on buffer page 0
-    double result_acc = 0;  // Local accumulator for C(ii, jj)
-    for (int colOffset=blockIdx.x*32; colOffset<N; colOffset+=32*gridDim.x) {
-        // Point to the appropriate buffer page
-        double * A_page = A_buff + currPage*pageSize;
-        double * w_page = w_buff + currPage*pageSize;
-        // Load A and w from global memory
-        if (tIsLoad) {
-            if (colOffset+32 > N) {
-                // This page is incomplete; pad it with zeroes
-                int nLeftover = N - colOffset;
-                for (int idx=tIdx; idx<A_buffSize; idx+=loadThreads)
-                    A_page[idx] = (idx<D*nLeftover) ? A[idx+D*colOffset] : 0;
-                if (ii >= 0)
-                    w_page[ii] = (ii<nLeftover) ? w[ii+colOffset] : 0;
-            } else {
-                // No need to worry about indices going out of bounds
-                for (int idx=tIdx; idx<A_buffSize; idx+=loadThreads)
-                    A_page[idx] = A[idx + D*colOffset];
-                if (ii >= 0)
-                    w_page[ii] = w[ii + colOffset];
-            }
-        }
-        // Wait for load to complete before computing on this page
+    // Main loop: grid-stride loop over complete buffers
+    int readOffset = READ_BUFF_SZ * blockIdx.x;
+    for ( ; readOffset <= N-READ_BUFF_SZ; readOffset += READ_BUFF_SZ*gridDim.x) {
+        // Load w from memory
+        if (tIdx < readOps_w)
+            w_buff[tIdx] = w[readOffset + tIdx];
+        // Load A from memory, 16 bytes at a time
+        double2 const *src = reinterpret_cast<double2 const*>(A + D*readOffset);
+        double2 *tgt = reinterpret_cast<double2*>(A_buff);
+        for (int idx = tIdx_A; idx < readOps_A; idx += nThreads)
+            tgt[idx] = src[idx];
+        // Wait for load to complete
         __syncthreads();
         // Compute
-        if (!tIsLoad) {
-            for (int kk=0; kk<32; kk+=2)
-                result_acc += A_page[ii+D*kk] * A_page[jj+D*kk] * w_page[kk];
+        if (ii >= 0) {
+            // Compute the result for this buffer
+            double local_acc = 0;
+            for (int kk=0; kk<READ_BUFF_SZ; kk++)
+                local_acc += A_buff[ii+D*kk] * A_buff[jj+D*kk] * w_buff[kk];
+            // Add it to the running total
+            result_acc += local_acc;
         }
-        // Switch buffer pages
-        currPage = (currPage+1) % 2;
+        // Wait for computation to finish
+        __syncthreads();
+    }
+    // Deal with remaining data
+    int nLeftover = N - readOffset;
+    if (nLeftover > 0) {
+        // Load remaining w
+        if (tIdx < nLeftover)
+            w_buff[tIdx] = w[readOffset + tIdx];
+        // Load remaining A
+        for (int idx = tIdx_A; idx < D*nLeftover; idx += nThreads)
+            A_buff[idx] = A[D*readOffset + idx];
+        // Wait for load to complete.
+        __syncthreads();
+        // Compute
+        if (ii >= 0) {
+            double local_acc = 0;
+            for (int kk=0; kk<nLeftover; kk++)
+                local_acc += A_buff[ii+D*kk] * A_buff[jj+D*kk] * w_buff[kk];
+            result_acc += local_acc;
+        }
     }
     
-    // Sum the compute halves and write output to global memory
-    if (!tIsLoad) {
-        // Write to shared memory
-        __syncthreads();
-        S[tIdx] = result_acc;
-        __syncthreads();
-        // Add the result from the other compute half
-        int transposeIdx = jj + ii*D;
-        if (tIdx==ii+D*jj) transposeIdx += D; // See compute thread layout
-        result_acc += S[transposeIdx];
-        // Write to global memory
-        double * C_block = C + blockIdx.x*D*D;
+    // Write output to global memory
+    if (ii >= 0) {
+        double *C_block = C + D*D*blockIdx.x;
         C_block[ii+D*jj] = result_acc;
+        // Write the other half as well
+        if (ii != jj)
+            C_block[jj+D*ii] = result_acc;
     }
 }
 
@@ -296,24 +281,31 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[])
         /* When D is small, we can improve GPU utilization by breaking X into
          * batches, computing the weighted covariance of each batch, and then
          * summing across the batches. */
-        int computeThreads = D*(D+1);
-        int sharedMemPerBlock = (D+1)*64*sizeof(*d_A);
-        int loadWarps = 1;
-        int blocksPerMP = 16;
-        /* Some hardcoded optimization (specific to Compute Capability 3.0) to
-         * maximize the number of load threads per block, but only if it doesn't
-         * affect the total # of blocks per multiprocessor. */
-        int computeWarps = (computeThreads+31)/32;
-        int const sharedMemLimit = 48*1024;
-        int const warpLimit = 64;
-        blocksPerMP = min(blocksPerMP, sharedMemLimit/sharedMemPerBlock);
-        blocksPerMP = min(blocksPerMP, warpLimit/(computeWarps+loadWarps));
-        int extraWarps = warpLimit - (computeWarps+loadWarps)*blocksPerMP;
-        loadWarps += extraWarps/blocksPerMP;
-        /* Figure out how many blocks. More blocks can potentially assist in GPU
-         * scheduling, but we get diminishing returns after we are able to
-         * saturate all available multiprocessors. Assumes 8 MPs. */
-        int numBlocks = min( (int) (N/1024)+1, 8*blocksPerMP );
+        
+        // Figure out how to maximize the kernel residency
+        int deviceNo;
+        cudaGetDevice(&deviceNo);
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, deviceNo);
+        int numMPs = prop.multiProcessorCount;
+        /* I haven't found a way to programatically determine the maximum number
+         * of blocks per multiprocessor or the total shared memory per MP, so 
+         * this is going to be hardcoded for Compute Capability 3.0 */
+        int maxWarpsPerMP = 64;
+        int maxSharedMemPerMP = 48*1024;
+        int maxBlocksPerMP = 16;
+        // Determine the maximum number of blocks per multiprocessor (MP)
+        int minWarpsPerBlock = (D*(D+1)/2 + 31)/32;
+        int sharedMemPerBlock = (D+1)*32*sizeof(*d_A);
+        int blocksPerMP = std::min( maxWarpsPerMP/minWarpsPerBlock, 
+                maxSharedMemPerMP/sharedMemPerBlock );
+        blocksPerMP = std::min(blocksPerMP, maxBlocksPerMP);
+        // Allocate additional warps if the limit allows. Although these won't
+        // participate in computation, they can help load data.
+        int warpsPerBlock = std::max(minWarpsPerBlock, maxWarpsPerMP/blocksPerMP);
+        // And decide on how many blocks total
+        int numBlocks = std::min( (int)(N/1024)+1, blocksPerMP*numMPs );
+        
         // Allocate memory for the outputs
         double *d_CBatched;
         cudaError_t cudaStat = cudaMalloc((void**)&d_CBatched, 
@@ -321,9 +313,9 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[])
         if (cudaStat != cudaSuccess)
             mexErrMsgIdAndTxt(cudaErrId, "Failed to allocate CUDA memory");
         // Launch our CUDA kernel to calculate the weighted covariance
-        int threadsPerBlock = computeThreads + 32*loadWarps;
+        int threadsPerBlock = 32*warpsPerBlock;
         calcWeightedCov<<<numBlocks,threadsPerBlock,sharedMemPerBlock>>>
-                (D, N, loadWarps, d_A, d_w, d_CBatched);
+                (D, N, d_A, d_w, d_CBatched);
         // Sum the batched results
         sumColumns<<<(D*D+31)/32, 32>>>(D*D, numBlocks, d_CBatched, d_C);
         // Free the memory that we'd allocated for the outputs
