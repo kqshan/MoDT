@@ -74,7 +74,7 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
     }
     
     // Allocate memory for the outputs (initally filled with zeroes)
-    size_t dims[] = {D, K, T};
+    size_t dims[] = {(size_t)D, (size_t)K, (size_t)T};
     mxArray *mx_wzuY = mxCreateNumericArray(3, dims, mxDOUBLE_CLASS, mxREAL);
     double *wzuY = mxGetPr(mx_wzuY);
     mxArray *mx_sumwzu = mxCreateDoubleMatrix(K, T, mxREAL);
