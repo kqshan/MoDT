@@ -4,6 +4,9 @@
 # OSX / *nix default autosave extension
 *.m~
 
+# MATLAB data files
+*.mat
+
 # MacOS X
 # Thumbnails
 ._*
