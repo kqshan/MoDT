@@ -13,7 +13,7 @@
 % User-defined model parameters
 %   mu_t          - [T+1 x 1] time frame boundaries (ms)
 %   nu            - t-distribution degrees of freedom
-%   Q             - [D x D] covariance of cluster drift, or scalar for diagonal
+%   Q             - [D x D] drift regularization matrix, or scalar for diagonal
 %   C_reg         - Diagonal ridge added to C to ensure well-conditioning
 % Training data (set using attachData)
 %   spk_Y         - [D x N] spike data
@@ -122,12 +122,18 @@ properties (SetAccess=protected)
     %       frame t is is defined as half-closed interval [ mu_t(t), mu_t(t+1) )
     mu_t = zeros(0,1);
     
-    % nu: Degrees-of-freedom parameter for the t distribution. Default = 7
+    % nu: Degrees-of-freedom parameter for the t distribution. This may range
+    %     from 1 to Inf, with smaller values corresponding to a heavier tails.
+    %     nu=1 corresponds to a Cauchy distribution, and nu=Inf corresponds to a
+    %     Gaussian distribution. Default = 7
     nu = 7;
     
-    % Q: [D x D] cluster drift covariance. If given as a scalar, it is treated
-    %    as a diagonal matrix with Q along the diagonal. Default = 1
-    Q = 1;
+    % Q: [D x D] cluster drift regularization matrix. If given as a scalar, it
+    %    is interpreted as a diagonal matrix with the given scalar along the
+    %    diagonal. Smaller values correspond to more regularization (producing
+    %    an estimated mu that is smoother over time). The units of this quantity
+    %    are (feature space units)^2/(time frame). Default = 0.033
+    Q = 0.033;
     
     % C_reg: Scalar that will be added to the diagonal of the scale matrix C
     %        during the M-step. Setting C_reg > 0 can help ensure that C is 
