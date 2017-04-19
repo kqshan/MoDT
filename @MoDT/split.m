@@ -96,6 +96,8 @@ elseif numel(prm.splitInit)==N
     S = max(split_assign);
     N_sub = numel(split_assign);
     Z = sparse((1:N_sub)',split_assign,1,N_sub,S);
+    % No sparse gpuArray support yet
+    if self.use_gpu, Z = full(Z); end
     
 elseif size(prm.splitInit,2)>1 && size(prm.splitInit,1)==N
     % [N x S] matrix of posterior likelihoods

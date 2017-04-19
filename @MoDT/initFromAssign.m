@@ -34,6 +34,10 @@ if isvector(assign)
         'assign: [N x 1] Cluster IDs must be positive integers');
     K_ = max(assign);
     assign = sparse(1:N, assign, 1, N, K_);
+    % No sparse gpuArray support yet
+    if self.use_gpu
+        assign = full(assign);
+    end
 else
     % Make sure these are legitimate posteriors
     assert(size(assign,1)==N, errid, errmsg);
