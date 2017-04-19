@@ -11,7 +11,10 @@ function [C, delta] = optimizeC( self, wzu, mu, sum_wz )
 %   sum_wz  [K x 1] sum of w(n,k)*Z(n,k) over all spikes for each component
 
 [N,K] = size(wzu); D = size(mu,1);
-min_rcond = 1/self.max_cond;
+% To make sure that the output of optimizeC() will be accepted by setParams()
+% (which checks the condition number of the C matrix it's given), we are going
+% to use a slightly more conservative condition number (by 5%) here.
+min_rcond = 1.05/self.max_cond;
 
 % Allocate memory
 C = zeros(D,D,K);
