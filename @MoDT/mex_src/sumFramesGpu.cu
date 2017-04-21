@@ -27,10 +27,14 @@
  * Kevin Shan, 2016-08-29
  *============================================================================*/
 
+#ifdef MATLAB_MEX_FILE
 #include "mex.h"
 #include "gpu/mxGPUArray.h"
+#endif
+
 #include <cuda_runtime.h>
 #include "cublas_v2.h"
+#include <thrust/device_vector.h>
 
 #include <iostream>
 #include <algorithm>
@@ -184,11 +188,13 @@ __global__ void sumFrames( int const D, long const N, int const K, int const T,
 
 /* Simple wrapper classes so we can do RAII-style cleanup 
  */
+#ifdef MATLAB_MEX_FILE
 struct mxGPUArrayCleanupWrapper {
     mxGPUArray const *mxgpu_ptr;
     mxGPUArrayCleanupWrapper(mxGPUArray const *p) {mxgpu_ptr = p;}
     ~mxGPUArrayCleanupWrapper(void) {mxGPUDestroyGPUArray(mxgpu_ptr);}
 };
+#endif
 struct cublasHandleCleanupWrapper {
     cublasHandle_t handle;
     cublasHandleCleanupWrapper(cublasHandle_t h) {handle = h;}
@@ -199,56 +205,36 @@ struct CudaDeleter {
 };
 
 
-/* Main entry point into this mex file
- * Inputs and outputs are arrays of mxArray pointers
+/* Define a "mexErrMsgIdAndTxt" function for the non-MATLAB case
  */
-void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[])
+#ifndef MATLAB_MEX_FILE
+void mexErrMsgIdAndTxt(char const *errId, char const *errMsg)
 {
-    // Check the inputs
+    std::cout << errId << std::endl << errMsg << std::endl;
+}
+#endif
+
+
+/* Main routine for computing the weighted sum over data frames
+ *
+ * Inputs:
+ *    D         Number of feature space dimensions
+ *    N         Number of spikes
+ *    K         Number of clusters
+ *    T         Number of time frames
+ *    d_Y       [D x N] data matrix (on GPU device)
+ *    d_wzu     [N x K] weights for each cluster x spike (on GPU device)
+ *    fsLim0    [T x 2] [first,last] data index (0-indexed) in each frame
+ * Outputs:
+ *    d_wzuY    [D x K x T] weighted sums for each frame (on GPU device)
+ *    d_sumwzu  [K x T] sums of weights in each frame (on GPU device)
+ */
+void computeFrameSums(ptrdiff_t D, ptrdiff_t N, ptrdiff_t K, ptrdiff_t T, 
+        double const *d_Y, double const *d_wzu, std::vector<ptrdiff_t> &fsLim0, 
+        double *d_wzuY, double *d_sumwzu)
+{
+    // Validate the fsLim indices and get the max # spikes per frame
     char const * const errId = "MoDT:sumFramesGpu:InvalidInput";
-    if (nrhs != 3)
-        mexErrMsgIdAndTxt(errId, "This function requires 3 inputs");
-    // Y (data) = input 0
-    mxArray const *mx_Y = prhs[0];
-    if (!mxIsGPUArray(mx_Y))
-        mexErrMsgIdAndTxt(errId, "Y must be a gpuArray");
-    mxGPUArray const *mgpu_Y = mxGPUCreateFromMxArray( mx_Y );
-    mxGPUArrayCleanupWrapper cleanup_Y(mgpu_Y);
-    if ((mxGPUGetNumberOfElements(mgpu_Y)==0) || 
-            (mxGPUGetNumberOfDimensions(mgpu_Y)!=2) ||
-            (mxGPUGetClassID(mgpu_Y)!=mxDOUBLE_CLASS))
-        mexErrMsgIdAndTxt(errId, "Y must a 2-D double-precision gpuArray");
-    size_t const *dims = mxGPUGetDimensions( mgpu_Y );
-    ptrdiff_t D = (ptrdiff_t) dims[0];
-    ptrdiff_t N = (ptrdiff_t) dims[1];
-    double const *d_Y = (double const *) mxGPUGetDataReadOnly( mgpu_Y );
-    // wzu (weights) = input 1
-    mxArray const *mx_wzu = prhs[1];
-    if (!mxIsGPUArray(mx_wzu))
-        mexErrMsgIdAndTxt(errId, "wzu must a gpuArray");
-    mxGPUArray const *mgpu_wzu = mxGPUCreateFromMxArray( mx_wzu );
-    mxGPUArrayCleanupWrapper cleanup_wzu(mgpu_wzu);
-    if ((mxGPUGetNumberOfElements(mgpu_wzu)==0) || 
-            (mxGPUGetNumberOfDimensions(mgpu_wzu)!=2) ||
-            (mxGPUGetClassID(mgpu_wzu)!=mxDOUBLE_CLASS))
-        mexErrMsgIdAndTxt(errId, "wzu must a 2-D double-precision gpuArray");
-    dims = mxGPUGetDimensions( mgpu_wzu );
-    ptrdiff_t N_wzu = (ptrdiff_t) dims[0];
-    ptrdiff_t K = (ptrdiff_t) dims[1];
-    if (N_wzu != N)
-        mexErrMsgIdAndTxt(errId, "wzu must be a [N x K] gpuArray");
-    double const *d_wzu = (double const *) mxGPUGetDataReadOnly( mgpu_wzu );
-    // fsLim (frame spike limits) = input 2
-    mxArray const *mx_fsLim = prhs[2];
-    ptrdiff_t T = mxGetM(mx_fsLim);
-    if (!mxIsDouble(mx_fsLim) || (T==0) || (mxGetN(mx_fsLim)!=2))
-        mexErrMsgIdAndTxt(errId, "f_spklim must be a [T x 2] array of doubles");
-    double const *fsLim = mxGetPr(mx_fsLim);
-    
-    // Validate and copy the fsLim indices to a vector of 0-indexed integers
-    std::vector<ptrdiff_t> fsLim0(T*2);
-    std::transform(fsLim, fsLim+2*T, fsLim0.begin(), 
-            [](double matlabIdx){ return ((ptrdiff_t) matlabIdx)-1; });
     int maxCount = 0;
     ptrdiff_t last_n2 = 0;
     for (int t=0; t<T; t++) {
@@ -263,18 +249,6 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[])
         // Get the difference
         maxCount = std::max(maxCount, (int)(n2-n1+1));
     }
-    
-    // Allocate memory for the outputs
-    std::vector<size_t> dims_wzuY = {(size_t)D, (size_t)K, (size_t)T};
-    mxGPUArray *mgpu_wzuY = mxGPUCreateGPUArray( 3, dims_wzuY.data(), 
-            mxDOUBLE_CLASS, mxREAL, MX_GPU_INITIALIZE_VALUES );
-    mxGPUArrayCleanupWrapper cleanup_wzuY(mgpu_wzuY);
-    double *d_wzuY = (double *) mxGPUGetData(mgpu_wzuY);
-    std::vector<size_t> dims_sumwzu = {(size_t)K, (size_t)T};
-    mxGPUArray *mgpu_sumwzu = mxGPUCreateGPUArray( 2, dims_sumwzu.data(),
-            mxDOUBLE_CLASS, mxREAL, MX_GPU_INITIALIZE_VALUES );
-    mxGPUArrayCleanupWrapper cleanup_sumwzu(mgpu_sumwzu);
-    double *d_sumwzu = (double *) mxGPUGetData(mgpu_sumwzu);
     
     // Sum across time frames
     cudaError_t cudaStat;
@@ -377,6 +351,75 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[])
             // Go on to the next time frame
         }
     }
+}
+
+
+#ifdef MATLAB_MEX_FILE
+/* Main entry point into this mex file
+ * Inputs and outputs are arrays of mxArray pointers
+ */
+void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[])
+{
+    // Check the inputs
+    char const * const errId = "MoDT:sumFramesGpu:InvalidInput";
+    if (nrhs != 3)
+        mexErrMsgIdAndTxt(errId, "This function requires 3 inputs");
+    // Y (data) = input 0
+    mxArray const *mx_Y = prhs[0];
+    if (!mxIsGPUArray(mx_Y))
+        mexErrMsgIdAndTxt(errId, "Y must be a gpuArray");
+    mxGPUArray const *mgpu_Y = mxGPUCreateFromMxArray( mx_Y );
+    mxGPUArrayCleanupWrapper cleanup_Y(mgpu_Y);
+    if ((mxGPUGetNumberOfElements(mgpu_Y)==0) || 
+            (mxGPUGetNumberOfDimensions(mgpu_Y)!=2) ||
+            (mxGPUGetClassID(mgpu_Y)!=mxDOUBLE_CLASS))
+        mexErrMsgIdAndTxt(errId, "Y must a 2-D double-precision gpuArray");
+    size_t const *dims = mxGPUGetDimensions( mgpu_Y );
+    ptrdiff_t D = (ptrdiff_t) dims[0];
+    ptrdiff_t N = (ptrdiff_t) dims[1];
+    double const *d_Y = (double const *) mxGPUGetDataReadOnly( mgpu_Y );
+    // wzu (weights) = input 1
+    mxArray const *mx_wzu = prhs[1];
+    if (!mxIsGPUArray(mx_wzu))
+        mexErrMsgIdAndTxt(errId, "wzu must a gpuArray");
+    mxGPUArray const *mgpu_wzu = mxGPUCreateFromMxArray( mx_wzu );
+    mxGPUArrayCleanupWrapper cleanup_wzu(mgpu_wzu);
+    if ((mxGPUGetNumberOfElements(mgpu_wzu)==0) || 
+            (mxGPUGetNumberOfDimensions(mgpu_wzu)!=2) ||
+            (mxGPUGetClassID(mgpu_wzu)!=mxDOUBLE_CLASS))
+        mexErrMsgIdAndTxt(errId, "wzu must a 2-D double-precision gpuArray");
+    dims = mxGPUGetDimensions( mgpu_wzu );
+    ptrdiff_t N_wzu = (ptrdiff_t) dims[0];
+    ptrdiff_t K = (ptrdiff_t) dims[1];
+    if (N_wzu != N)
+        mexErrMsgIdAndTxt(errId, "wzu must be a [N x K] gpuArray");
+    double const *d_wzu = (double const *) mxGPUGetDataReadOnly( mgpu_wzu );
+    // fsLim (frame spike limits) = input 2
+    mxArray const *mx_fsLim = prhs[2];
+    ptrdiff_t T = mxGetM(mx_fsLim);
+    if (!mxIsDouble(mx_fsLim) || (T==0) || (mxGetN(mx_fsLim)!=2))
+        mexErrMsgIdAndTxt(errId, "f_spklim must be a [T x 2] array of doubles");
+    double const *fsLim = mxGetPr(mx_fsLim);
+    
+    // Copy the fsLim indices to a vector of 0-indexed integers
+    std::vector<ptrdiff_t> fsLim0(T*2);
+    std::transform(fsLim, fsLim+2*T, fsLim0.begin(), 
+            [](double matlabIdx){ return ((ptrdiff_t) matlabIdx)-1; });
+    
+    // Allocate memory for the outputs
+    std::vector<size_t> dims_wzuY = {(size_t)D, (size_t)K, (size_t)T};
+    mxGPUArray *mgpu_wzuY = mxGPUCreateGPUArray( 3, dims_wzuY.data(), 
+            mxDOUBLE_CLASS, mxREAL, MX_GPU_INITIALIZE_VALUES );
+    mxGPUArrayCleanupWrapper cleanup_wzuY(mgpu_wzuY);
+    double *d_wzuY = (double *) mxGPUGetData(mgpu_wzuY);
+    std::vector<size_t> dims_sumwzu = {(size_t)K, (size_t)T};
+    mxGPUArray *mgpu_sumwzu = mxGPUCreateGPUArray( 2, dims_sumwzu.data(),
+            mxDOUBLE_CLASS, mxREAL, MX_GPU_INITIALIZE_VALUES );
+    mxGPUArrayCleanupWrapper cleanup_sumwzu(mgpu_sumwzu);
+    double *d_sumwzu = (double *) mxGPUGetData(mgpu_sumwzu);
+    
+    // Sum across time frames
+    computeFrameSums(D, N, K, T, d_Y, d_wzu, fsLim0, d_wzuY, d_sumwzu);
     
     // Output 0 = wzuY
     if (nlhs >= 1)
@@ -385,3 +428,38 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[])
     if (nlhs >= 2)
         plhs[1] = mxGPUCreateMxArrayOnGPU( mgpu_sumwzu );
 }
+
+#else
+
+/* Main entry point if this is compiled externally (i.e. not as a MEX file)
+ * This sets up and runs a simple example program and is suitable for benchmarking
+ */
+int main(int argc, char* argv[])
+{
+    // Define the sizes
+    size_t D = (argc > 1) ? (size_t) std::atoi(argv[1]) : 12;
+    size_t N = (argc > 2) ? (size_t) std::atoi(argv[2]) : 500000;
+    size_t K = (argc > 3) ? (size_t) std::atoi(argv[3]) : 25;
+    size_t T = (argc > 4) ? (size_t) std::atoi(argv[4]) : 100;
+    // Create the data
+    thrust::device_vector<double> Y(D*N,1);
+    thrust::device_vector<double> wzu(N*K,1);
+    std::vector<ptrdiff_t> fsLim(T*2);
+    for (int t=0; t<T; t++) {
+        fsLim[t]   = (t*N)/T;         // fsLim[t,0] = first in frame
+        fsLim[t+T] = ((t+1)*N)/T - 1; // fsLim[t,1] = last in frame
+    }
+    thrust::device_vector<double> wzuY(D*K*T,1);
+    thrust::device_vector<double> sumwzu(K*T,1);
+    // Extract the raw pointers
+    double *d_Y = thrust::raw_pointer_cast(Y.data());
+    double *d_wzu = thrust::raw_pointer_cast(wzu.data());
+    double *d_wzuY = thrust::raw_pointer_cast(wzuY.data());
+    double *d_sumwzu = thrust::raw_pointer_cast(sumwzu.data());
+    
+    // Sum across time frames
+    computeFrameSums(D, N, K, T, d_Y, d_wzu, fsLim, d_wzuY, d_sumwzu);
+}
+
+#endif
+

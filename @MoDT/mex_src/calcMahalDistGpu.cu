@@ -18,12 +18,17 @@
  * Kevin Shan, 2016-06-16
  *============================================================================*/
 
+#ifdef MATLAB_MEX_FILE
 #include "mex.h"
 #include "gpu/mxGPUArray.h"
+#endif
+
 #include <cuda_runtime.h>
 #include "cublas_v2.h"
+#include <thrust/device_vector.h>
 
-#include <stdio.h>
+#include <iostream>
+#include <cstdlib>
 #include <algorithm>
 #include <utility>
 #include <limits>
@@ -54,6 +59,7 @@ __device__ double dblShfl_down(double var, unsigned int delta, int width=32)
 
 /* Simple wrapper classes so we can do RAII-style cleanup 
  */
+#ifdef MATLAB_MEX_FILE
 struct mxGPUArrayCleanupWrapper {
     mxGPUArray const *mxgpu_ptr;
     mxGPUArrayCleanupWrapper(mxGPUArray const *p) {mxgpu_ptr = p;}
@@ -64,6 +70,7 @@ struct mxArrayCleanupWrapper {
     mxArrayCleanupWrapper(mxArray *p) {mx_ptr = p;}
     ~mxArrayCleanupWrapper(void) {mxDestroyArray(mx_ptr);}
 };
+#endif
 struct cublasHandleCleanupWrapper {
     cublasHandle_t handle;
     cublasHandleCleanupWrapper(cublasHandle_t h) {handle = h;}
@@ -570,54 +577,36 @@ __global__ void sumSqCols( int const D, int const N,
 }
 
 
-/* Main entry point into this mex file
- * Inputs and outputs are arrays of mxArray pointers
+/* Define a "mexErrMsgIdAndTxt" function for the non-MATLAB case
  */
-void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[])
+#ifndef MATLAB_MEX_FILE
+void mexErrMsgIdAndTxt(char const *errId, char const *errMsg)
 {
-    // Check the inputs
-    char const * const errId = "MoDT:calcMahalDistGpu:InvalidInput";
-    if (nrhs != 2)
-        mexErrMsgIdAndTxt(errId, "This function requires 2 inputs");
-    // L = input 0
-    mxArray const *mx_L = prhs[0];
-    if (mxIsGPUArray(mx_L))
-        mexErrMsgIdAndTxt(errId, "L should not be a gpuArray");
-    size_t D = mxGetM(mx_L);
-    if ((D==0) || (D!=mxGetN(mx_L)) || !mxIsDouble(mx_L))
-        mexErrMsgIdAndTxt(errId, "L must be a square double-precision matrix");
-    double const *L = mxGetPr(mx_L);
-    // X = input 1
-    mxArray const *mx_X = prhs[1];
-    if (!mxIsGPUArray(mx_X))
-        mexErrMsgIdAndTxt(errId, "X must a gpuArray");
-    mxGPUArray const *mgpu_X = mxGPUCreateFromMxArray( mx_X );
-    mxGPUArrayCleanupWrapper cleanup_X(mgpu_X);
-    if ((mxGPUGetNumberOfElements(mgpu_X)==0) || 
-            (mxGPUGetNumberOfDimensions(mgpu_X)!=2) ||
-            (mxGPUGetClassID(mgpu_X)!=mxDOUBLE_CLASS))
-        mexErrMsgIdAndTxt(errId, "X must a 2-D double-precision array");
-    size_t const *dims = mxGPUGetDimensions( mgpu_X );
-    if (dims[0] != D)
-        mexErrMsgIdAndTxt(errId, "X must be a [D x N] gpuArray");
-    size_t N = dims[1];
-    double const *d_X = (double const *) mxGPUGetDataReadOnly( mgpu_X );
-    
-    // Allocate memory for the output
-    size_t dims_delta[2] = {N, 1};
-    mxGPUArray *mgpu_delta = mxGPUCreateGPUArray(2, dims_delta, 
-            mxDOUBLE_CLASS, mxREAL, MX_GPU_DO_NOT_INITIALIZE);
-    mxGPUArrayCleanupWrapper cleanup_delta(mgpu_delta);
-    double *d_delta = (double *) mxGPUGetData(mgpu_delta);
-    
-    // Compute delta = sum((L\X).^2,1)'
+    std::cout << errId << std::endl << errMsg << std::endl;
+}
+#endif
+
+
+/* Main routine for computing the Mahalanobis distance
+ * 
+ * Inputs:
+ *    D         #rows in X and size of L (number of feature space dimensions)
+ *    N         #cols in X (number of spikes)
+ *    L         [D x D] lower Cholesky-factorized covariance matrix
+ *    d_X       [D x N] data matrix (on GPU device)
+ % Outputs:
+ *    d_delta   [N] squared Mahalanobis distances (on GPU device)
+ */
+void computeMahalDist(size_t D, size_t N, 
+        double const *L, double const *d_X, double *d_delta)
+{
     char const * const cudaErrId = "MoDT:calcMahalDistGpu:cudaError";
     if (D <= 28) {
         /* We have a kernel that performs a triangular solve and computes the
          * squared norm of each column, and it's optimized for small matrices */
         // I should have thought more carefully about where to use ints...
         if (D*N > std::numeric_limits<int>::max())
-            mexErrMsgIdAndTxt(errId,
+            mexErrMsgIdAndTxt("MoDT:calcMahalDistGpu:InvalidInput",
                     "Large arrays (> 2^31 elements) not currently supported");
         // Create an execution plan for the kernel and transfer it to the device
         KernelPlan plan(D, L);
@@ -677,6 +666,52 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[])
         int numBlocks = std::min(64, (int)(N/sumSqCols_blockDim_y)+1);
         sumSqCols<<<numBlocks,threadsPerBlock>>>(D, N, d_X_copy, d_delta);
     }
+}
+
+
+#ifdef MATLAB_MEX_FILE
+/* Main entry point into this mex file
+ * Inputs and outputs are arrays of mxArray pointers
+ */
+void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[])
+{
+    // Check the inputs
+    char const * const errId = "MoDT:calcMahalDistGpu:InvalidInput";
+    if (nrhs != 2)
+        mexErrMsgIdAndTxt(errId, "This function requires 2 inputs");
+    // L = input 0
+    mxArray const *mx_L = prhs[0];
+    if (mxIsGPUArray(mx_L))
+        mexErrMsgIdAndTxt(errId, "L should not be a gpuArray");
+    size_t D = mxGetM(mx_L);
+    if ((D==0) || (D!=mxGetN(mx_L)) || !mxIsDouble(mx_L))
+        mexErrMsgIdAndTxt(errId, "L must be a square double-precision matrix");
+    double const *L = mxGetPr(mx_L);
+    // X = input 1
+    mxArray const *mx_X = prhs[1];
+    if (!mxIsGPUArray(mx_X))
+        mexErrMsgIdAndTxt(errId, "X must a gpuArray");
+    mxGPUArray const *mgpu_X = mxGPUCreateFromMxArray( mx_X );
+    mxGPUArrayCleanupWrapper cleanup_X(mgpu_X);
+    if ((mxGPUGetNumberOfElements(mgpu_X)==0) || 
+            (mxGPUGetNumberOfDimensions(mgpu_X)!=2) ||
+            (mxGPUGetClassID(mgpu_X)!=mxDOUBLE_CLASS))
+        mexErrMsgIdAndTxt(errId, "X must a 2-D double-precision array");
+    size_t const *dims = mxGPUGetDimensions( mgpu_X );
+    if (dims[0] != D)
+        mexErrMsgIdAndTxt(errId, "X must be a [D x N] gpuArray");
+    size_t N = dims[1];
+    double const *d_X = (double const *) mxGPUGetDataReadOnly( mgpu_X );
+    
+    // Allocate memory for the output
+    size_t dims_delta[2] = {N, 1};
+    mxGPUArray *mgpu_delta = mxGPUCreateGPUArray(2, dims_delta, 
+            mxDOUBLE_CLASS, mxREAL, MX_GPU_DO_NOT_INITIALIZE);
+    mxGPUArrayCleanupWrapper cleanup_delta(mgpu_delta);
+    double *d_delta = (double *) mxGPUGetData(mgpu_delta);
+    
+    // Compute delta = sum((L\X).^2,1)'
+    computeMahalDist(D, N, L, d_X, d_delta);
     
     // Output 0 = delta
     if (nlhs >= 1) {
@@ -686,3 +721,31 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[])
     }
     // Cleanup done by our wrapper classes
 }
+
+#else
+
+/* Main entry point if this is compiled externally (i.e. not as a MEX file)
+ * This sets up and runs a simple example program and is suitable for benchmarking
+ */
+int main(int argc, char* argv[])
+{
+    // Define the sizes
+    size_t D = (argc > 1) ? (size_t) std::atoi(argv[1]) : 12;
+    size_t N = (argc > 2) ? (size_t) std::atoi(argv[2]) : 500000;
+    // Create the data
+    thrust::device_vector<double> X(D*N,1);
+    thrust::device_vector<double> delta(N,1);
+    std::vector<double> L(D*D,0);
+    for (int i=0; i<D; i++)
+        L[i+D*i] = 1;    
+    // Extract the raw pointers
+    double *d_X = thrust::raw_pointer_cast(X.data());
+    double *d_delta = thrust::raw_pointer_cast(delta.data());
+    double *h_L = L.data();
+    
+    // Compute delta = sum((L\X).^2,1)'
+    computeMahalDist(D, N, h_L, d_X, d_delta);
+}
+
+#endif
+

@@ -20,14 +20,18 @@
  * Kevin Shan, 2016-06-14
  *============================================================================*/
 
+#ifdef MATLAB_MEX_FILE
 #include "mex.h"
 #include "gpu/mxGPUArray.h"
+#endif
+
 #include <cuda_runtime.h>
 #include "cublas_v2.h"
+#include <thrust/device_vector.h>
 
-#include <stdio.h>
+#include <iostream>
+#include <cstdlib>
 #include <algorithm>
-#include <utility>
 
 
 /* CUDA kernel for computing A*diag(w)*A'
@@ -204,78 +208,42 @@ __global__ void sqrtScaledCopy(int D, int N,
 
 /* Simple wrapper classes so we can do RAII-style cleanup 
  */
+#ifdef MATLAB_MEX_FILE
 struct mxGPUArrayCleanupWrapper {
     mxGPUArray const *mxgpu_ptr;
     mxGPUArrayCleanupWrapper(mxGPUArray const *p) {mxgpu_ptr = p;}
     ~mxGPUArrayCleanupWrapper(void) {mxGPUDestroyGPUArray(mxgpu_ptr);}
 };
+#endif
 struct cublasHandleCleanupWrapper {
     cublasHandle_t handle;
     cublasHandleCleanupWrapper(cublasHandle_t h) {handle = h;}
     ~cublasHandleCleanupWrapper(void) {cublasDestroy(handle);}
 };
 
-
-/* Main entry point into this mex file
- * Inputs and outputs are arrays of mxArray pointers
+/* Define a "mexErrMsgIdAndTxt" function for the non-MATLAB case
  */
-void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[])
+#ifndef MATLAB_MEX_FILE
+void mexErrMsgIdAndTxt(char const *errId, char const *errMsg)
 {
-    // Check the inputs
-    char const * const errId = "MoDT:weightCovGpu:InvalidInput";
-    if (nrhs != 3)
-        mexErrMsgIdAndTxt(errId, "This function requires 3 inputs");
-    // A = input 0
-    mxArray const *mx_A = prhs[0];
-    if (!mxIsGPUArray(mx_A))
-        mexErrMsgIdAndTxt(errId, "A must be a gpuArray");
-    mxGPUArray const *mgpu_A = mxGPUCreateFromMxArray( mx_A );
-    mxGPUArrayCleanupWrapper cleanup_A(mgpu_A);
-    if ((mxGPUGetNumberOfElements(mgpu_A)==0) || 
-            (mxGPUGetNumberOfDimensions(mgpu_A)!=2) ||
-            (mxGPUGetClassID(mgpu_A)!=mxDOUBLE_CLASS))
-        mexErrMsgIdAndTxt(errId, "A must a 2-D double-precision gpuArray");
-    size_t const *dims = mxGPUGetDimensions( mgpu_A );
-    size_t D = dims[0];
-    size_t N = dims[1];
-    double const *d_A = (double const *) mxGPUGetDataReadOnly( mgpu_A );
-    // weights = input 1
-    mxArray const *mx_weights = prhs[1];
-    if (!mxIsGPUArray(mx_weights))
-        mexErrMsgIdAndTxt(errId, "weights must a gpuArray");
-    mxGPUArray const *mgpu_weights = mxGPUCreateFromMxArray( mx_weights );
-    mxGPUArrayCleanupWrapper cleanup_weights(mgpu_weights);
-    if ((mxGPUGetNumberOfElements(mgpu_weights)==0) || 
-            (mxGPUGetNumberOfDimensions(mgpu_weights)!=2) ||
-            (mxGPUGetClassID(mgpu_weights)!=mxDOUBLE_CLASS))
-        mexErrMsgIdAndTxt(errId, "weights must a 2-D double-precision gpuArray");
-    dims = mxGPUGetDimensions( mgpu_weights );
-    size_t N_weights = dims[0];
-    size_t K = dims[1];
-    if (N_weights != N)
-        mexErrMsgIdAndTxt(errId, "weights must be a [N x K] gpuArray");
-    double const *d_weights = 
-            (double const *) mxGPUGetDataReadOnly( mgpu_weights );
-    // k (weight index) = input 2
-    mxArray const *mx_k = prhs[2];
-    if (!mxIsScalar(mx_k))
-        mexErrMsgIdAndTxt(errId, "k must be a scalar");
-    ptrdiff_t weight_index = ((ptrdiff_t) mxGetScalar(mx_k)) - 1;
-    if ((weight_index < 0) || (weight_index >= K))
-        mexErrMsgIdAndTxt(errId, "k is out of bounds");
-    
-    // Now we can get a pointer to the selected column of the weights
-    double const *d_w = d_weights + weight_index*N;
-    
-    // Allocate memory for the output
-    size_t dims_C[2];
-    dims_C[0] = D; dims_C[1] = D;
-    mxGPUArray *mgpu_C = mxGPUCreateGPUArray(2, dims_C, 
-            mxDOUBLE_CLASS, mxREAL, MX_GPU_DO_NOT_INITIALIZE);
-    mxGPUArrayCleanupWrapper cleanup_C(mgpu_C);
-    double *d_C = (double *) mxGPUGetData(mgpu_C);
-    
-    // Compute C = A*diag(w)*A'
+    std::cout << errId << std::endl << errMsg << std::endl;
+}
+#endif
+
+
+/* Main routine for computing the weighted covariance
+ *
+ * Inputs:
+ *    D         #rows in A (number of feature space dimensions)
+ *    N         #cols in A and entries in w (number of spikes)
+ *    d_A       [D x N] data matrix (on GPU device)
+ *    d_w       [N] vector of weights (on GPU device)
+ * Outputs:
+ *    d_C       [D x D] covariance matrix
+ */
+void computeWeightedCov(size_t D, size_t N, 
+        double const * d_A, double const * d_w, double * d_C)
+{
     char const * const cudaErrId = "MoDT:weightCovGpu:cudaError";
     if (D < 32) {
         /* When D is small, we can improve GPU utilization by breaking X into
@@ -353,6 +321,71 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[])
         if (stat != CUBLAS_STATUS_SUCCESS)
             mexErrMsgIdAndTxt(cudaErrId, "cuBLAS error during GEMM");
     }
+}
+
+
+#ifdef MATLAB_MEX_FILE
+/* Main entry point into this mex file
+ * Inputs and outputs are arrays of mxArray pointers
+ */
+void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[])
+{
+    // Check the inputs
+    char const * const errId = "MoDT:weightCovGpu:InvalidInput";
+    if (nrhs != 3)
+        mexErrMsgIdAndTxt(errId, "This function requires 3 inputs");
+    // A = input 0
+    mxArray const *mx_A = prhs[0];
+    if (!mxIsGPUArray(mx_A))
+        mexErrMsgIdAndTxt(errId, "A must be a gpuArray");
+    mxGPUArray const *mgpu_A = mxGPUCreateFromMxArray( mx_A );
+    mxGPUArrayCleanupWrapper cleanup_A(mgpu_A);
+    if ((mxGPUGetNumberOfElements(mgpu_A)==0) || 
+            (mxGPUGetNumberOfDimensions(mgpu_A)!=2) ||
+            (mxGPUGetClassID(mgpu_A)!=mxDOUBLE_CLASS))
+        mexErrMsgIdAndTxt(errId, "A must a 2-D double-precision gpuArray");
+    size_t const *dims = mxGPUGetDimensions( mgpu_A );
+    size_t D = dims[0];
+    size_t N = dims[1];
+    double const *d_A = (double const *) mxGPUGetDataReadOnly( mgpu_A );
+    // weights = input 1
+    mxArray const *mx_weights = prhs[1];
+    if (!mxIsGPUArray(mx_weights))
+        mexErrMsgIdAndTxt(errId, "weights must a gpuArray");
+    mxGPUArray const *mgpu_weights = mxGPUCreateFromMxArray( mx_weights );
+    mxGPUArrayCleanupWrapper cleanup_weights(mgpu_weights);
+    if ((mxGPUGetNumberOfElements(mgpu_weights)==0) || 
+            (mxGPUGetNumberOfDimensions(mgpu_weights)!=2) ||
+            (mxGPUGetClassID(mgpu_weights)!=mxDOUBLE_CLASS))
+        mexErrMsgIdAndTxt(errId, "weights must a 2-D double-precision gpuArray");
+    dims = mxGPUGetDimensions( mgpu_weights );
+    size_t N_weights = dims[0];
+    size_t K = dims[1];
+    if (N_weights != N)
+        mexErrMsgIdAndTxt(errId, "weights must be a [N x K] gpuArray");
+    double const *d_weights = 
+            (double const *) mxGPUGetDataReadOnly( mgpu_weights );
+    // k (weight index) = input 2
+    mxArray const *mx_k = prhs[2];
+    if (!mxIsScalar(mx_k))
+        mexErrMsgIdAndTxt(errId, "k must be a scalar");
+    ptrdiff_t weight_index = ((ptrdiff_t) mxGetScalar(mx_k)) - 1;
+    if ((weight_index < 0) || (weight_index >= K))
+        mexErrMsgIdAndTxt(errId, "k is out of bounds");
+    
+    // Now we can get a pointer to the selected column of the weights
+    double const *d_w = d_weights + weight_index*N;
+    
+    // Allocate memory for the output
+    size_t dims_C[2];
+    dims_C[0] = D; dims_C[1] = D;
+    mxGPUArray *mgpu_C = mxGPUCreateGPUArray(2, dims_C, 
+            mxDOUBLE_CLASS, mxREAL, MX_GPU_DO_NOT_INITIALIZE);
+    mxGPUArrayCleanupWrapper cleanup_C(mgpu_C);
+    double *d_C = (double *) mxGPUGetData(mgpu_C);
+    
+    // Compute C = A*diag(w)*A'
+    computeWeightedCov(D, N, d_A, d_w, d_C);
     
     // Output 0 = C
     if (nlhs >= 1) {
@@ -363,3 +396,29 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[])
     
     // Cleanup done by our wrapper classes
 }
+
+#else
+
+/* Main entry point if this is compiled externally (i.e. not as a MEX file)
+ * This sets up and runs a simple example program and is suitable for benchmarking
+ */
+int main(int argc, char* argv[])
+{
+    // Define the sizes
+    size_t D = (argc > 1) ? (size_t) std::atoi(argv[1]) : 12;
+    size_t N = (argc > 2) ? (size_t) std::atoi(argv[2]) : 500000;
+    // Create the data
+    thrust::device_vector<double> A(D*N,1);
+    thrust::device_vector<double> w(N,1);
+    thrust::device_vector<double> C(D*D,0);
+    // Extract the raw pointers
+    double *d_A = thrust::raw_pointer_cast(A.data());
+    double *d_w = thrust::raw_pointer_cast(w.data());
+    double *d_C = thrust::raw_pointer_cast(C.data());
+    
+    // Compute C = A*diag(w)*A'
+    computeWeightedCov(D, N, d_A, d_w, d_C);
+}
+
+#endif
+
