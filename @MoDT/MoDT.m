@@ -158,6 +158,11 @@ properties (SetAccess=protected)
     %        Default = 1. If use_gpu==true, this will be a gpuArray
     spk_w = 1;
 end
+properties (Access=protected)
+    % Datatype of spk_Y, which will determine datatype of most operations
+    % Currently supported: {single, double}
+    datatype = 'None';
+end
 
 % Other parameters
 properties (SetAccess=protected)
@@ -254,6 +259,8 @@ methods
         % Also update the dimensions
         self.N = NaN;
         if isempty(self.mu) && isscalar(self.Q), self.D = NaN; end
+        % And datatype
+        self.datatype = 'None';
     end
     
     % Return computed values from this model

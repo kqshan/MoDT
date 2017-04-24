@@ -50,12 +50,23 @@ if isempty(prm.tlim)
     prm.tlim = t_([1 end]);
 end
 
+% Determine the datatype
+if isa(Y_, 'gpuArray')
+    datatype_ = classUnderlying(Y_);
+else
+    datatype_ = class(Y_);
+end
+assert(ismember(datatype_,{'single','double'}), self.badValueErrId, ...
+    'Datatype must be single- or double-precision floating point');
+
 % (2) Assign values ------------------------------------------------------------
 
 % Clear caches
 self.clearCache();
 self.clearFrames();
 
+% Set the datatype
+self.datatype = datatype_;
 % Assign Y,t,w
 if self.use_gpu
     self.spk_Y = gpuArray(Y_);

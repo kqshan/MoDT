@@ -17,11 +17,11 @@ function [C, delta] = optimizeC( self, wzu, mu, sum_wz )
 min_rcond = 1.05/self.max_cond;
 
 % Allocate memory
-C = zeros(D,D,K);
+C = zeros(D,D,K, self.datatype);
 if self.use_gpu
-    delta = zeros(N,K,'gpuArray');
+    delta = gpuArray.zeros(N,K, self.datatype);
 else
-    delta = zeros(N,K);
+    delta = zeros(N,K, self.datatype);
 end
 
 % Loop over clusters

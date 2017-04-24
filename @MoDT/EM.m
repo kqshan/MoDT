@@ -77,10 +77,19 @@ end
 if self.use_gpu
     % Sparse operations are not currently supported for gpuArrays
     assert(prm.sparseThresh <= 0, ...
-        'MoDT:EM:GPUError', ...
+        'MoDT:EM:SparseNotSupported', ...
         'Sparse matrix operations are not currently supported for GPU arrays');
     % If Z is overridden, make sure it is a gpuArray
     if ~isempty(override_Z), override_Z = gpuArray(full(override_Z)); end
+end
+% And for single precision
+if strcmp(self.datatype, 'single')
+    % Sparse operations are not currently supported for single precision
+    assert(prm.sparseThresh <= 0, ...
+        'MoDT:EM:SparseNotSupported', ...
+        'Sparse matrix operations are not supported for single precision');
+    % If Z is overridden, make sure it's full and single precision
+    if ~isempty(override_Z), override_Z = single(full(override_Z)); end
 end
 
 % Initial E step to get a base log-likelihood

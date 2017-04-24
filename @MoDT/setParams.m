@@ -83,7 +83,8 @@ if ismember('alpha',user_spec)
     assert(numel(p.alpha)==K_, self.badDimErrId, ...
         'alpha must be a vector with K=%d elements', K_);
     p.alpha = p.alpha(:);
-    assert(isempty(p.alpha) || (all(p.alpha>=0) && abs(sum(p.alpha)-1)<1e-6), ...
+    assert(isempty(p.alpha) || (all(p.alpha>=0) && ...
+        abs(sum(p.alpha)-1)<100*eps(class(p.alpha)) ), ...
         self.badValueErrId, 'alpha must be nonnegative and sum to 1');
 end
 reset_frame_assignment = false;
@@ -106,7 +107,6 @@ end
 if ismember('C',user_spec)
     assert(size(p.C,1)==D_ && size(p.C,2)==D_ && size(p.C,3)==K_, ...
         self.badDimErrId, 'C must be [%d x %d x %d]', D_,D_,K_);
-    p.C = double(p.C);
     is_ok = false(K_,1);
     for k = 1:K_
         is_ok(k) = is_pos_def(p.C(:,:,k), max_cond_);

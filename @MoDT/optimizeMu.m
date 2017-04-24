@@ -23,6 +23,9 @@ end
 % Solve mu = H \ b
 % Start with the process information matrix
 B_Q = make_Qinv_matrix( self.Q, D, T );
+if strcmp(self.datatype,'single')
+    B_Q = single(B_Q);
+end
 % This Qinv matrix determines the banded structure of H, so we can pre-compute
 % some structural information that will be useful for our call to sparse()
 % later. We don't need this for the MEX version, which uses this banded storage
@@ -37,9 +40,9 @@ if ~self.use_mex
 end
 % Allocate memory
 if self.use_gpu
-    mu = zeros(D, T, K, 'gpuArray');
+    mu = gpuArray.zeros(D, T, K, self.datatype);
 else
-    mu = zeros(D, T, K);
+    mu = zeros(D, T, K, self.datatype);
 end
 % Do each cluster
 for k = 1:K
@@ -57,6 +60,8 @@ for k = 1:K
     
     % Solve H \ b
     if ~self.use_mex
+        % MATLAB doesn't support single-precision sparse yet (as of R2017a)
+        B = double(B); b = double(b);
         % Construct H as a sparse matrix
         H = sparse(H_i, H_j, B(H_mask), D*T, D*T);
         % Solve
@@ -115,11 +120,13 @@ else
     if ~use_mex
         % Allocate memory
         if isa(Y,'gpuArray')
-            sum_wzu = zeros(K,T,'gpuArray');
-            wzuY = zeros(D,K,T,'gpuArray');
+            datatype = classUnderlying(Y);
+            sum_wzu = gpuArray.zeros(K,T, datatype);
+            wzuY = gpuArray.zeros(D,K,T, datatype);
         else
-            sum_wzu = zeros(K,T);
-            wzuY = zeros(D,K,T);
+            datatype = class(Y);
+            sum_wzu = zeros(K,T, datatype);
+            wzuY = zeros(D,K,T, datatype);
         end
         % For loop over time frames
         for t = 1:T

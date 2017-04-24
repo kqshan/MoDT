@@ -11,15 +11,15 @@ function [Z, U] = Estep(self)
 D = self.D; K = self.K; N = self.N;
 
 % Calculate the Mahalanobis distances and determinant of the covariance
-logSqrtDetC = zeros(K,1);
+logSqrtDetC = zeros(K,1, self.datatype);
 if isempty(self.mahal_dist)
     % Need to compute the Mahalanobis distance
     % Allocate memory
     if self.use_gpu
-        delta = zeros(N,K,'gpuArray');
+        delta = gpuArray.zeros(N,K, self.datatype);
         mu = gpuArray(self.mu);
     else
-        delta = zeros(N,K);
+        delta = zeros(N,K, self.datatype);
         mu = self.mu;
     end
     % Compute for each 
