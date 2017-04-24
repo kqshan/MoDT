@@ -114,14 +114,14 @@ for ii = 1:nCases
     end
     % Try a dry run first
     modt.setParams(starting_params);
-    modt.attachData(spk_Y, spk_t);
+    modt.attachData(spk_Y, spk_t, spk_w);
     modt.EM('maxIter',3);
     modt.detachData();
     % Do it for real
     fprintf('Running %s\n', modt_desc{ii});
     t_start = tic();
     modt.setParams(starting_params);
-    modt.attachData(spk_Y, spk_t);
+    modt.attachData(spk_Y, spk_t, spk_w);
     modt.EM('minIter',nIter, 'maxIter',nIter);
     t_elapsed = toc(t_start);
     % If this was a subset, then measure the log-likelihood on the full dataset
