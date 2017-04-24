@@ -6,6 +6,8 @@
 
 # MATLAB data files
 *.mat
+# MATLAB precompiled libraries
+*.mex*
 
 # MacOS X
 # Thumbnails
