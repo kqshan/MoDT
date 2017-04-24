@@ -11,8 +11,15 @@ function x = bandPosSolve(A_bands, b)
 % The MEX version directly calls the LAPACK routine for solving a banded
 % positive definite matrix, whereas the MATLAB code involves an inefficient step
 % of converting this to a compressed sparse column (CSC) representation.
+%
+% The MEX version also supports single-precision arithmetic, whereas the MATLAB
+% code performs everything in double-precision, though it will cast x as single
+% if A_bands or b is single-precision.
 
 [p,N] = size(A_bands);
+
+% MATLAB doesn't support single-precision sparse yet (as of R2017a)
+A_bands = double(A_bands); b = double(b);
 
 % Call sparse() to construct A
 q = (p - 1) / 2; % Number of superdiagonals
@@ -23,5 +30,10 @@ A = sparse(i(mask), j(mask), A_bands(mask), N, N);
 
 % Solve A*x = b
 x = A \ b;
+
+% Cast to single if A or b was single
+if isa(A_bands,'single') || isa(b,'single')
+    x = single(x);
+end
 
 end

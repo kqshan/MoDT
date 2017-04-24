@@ -236,8 +236,50 @@ else
     fprintf('PASS\n');
 end
 
-% 3. Let's measure the speedup on a slightly larger problem
-fprintf('%s','3. Measuring MEX file speedup: ');
+% 3. It should give approximate results for single-precision floating point
+fprintf('%-68s','3. Testing on single-precision floating-point values');
+failed = false;
+rel_err_thresh = 100 * eps('single');
+for ii = 1:nTests
+    [D,N,K,T] = deal(DNKT{ii,:});
+    % Generate random inputs
+    Y = randn(D,N) + 2;
+    wzu = rand(N,K);
+    frame_edge = sort(randi(N+1,[T-1, 1]))-1;
+    f_spkLim = [[1; frame_edge+1], [frame_edge; N]];
+    % Convert to single-precision
+    Y = single(Y);
+    wzu = single(wzu);
+    % Call the non-MEX version to get the correct answer
+    [wzuY_ref, sum_wzu_ref] = sumFrames(Y, wzu, f_spkLim);
+    % Call the MEX version
+    [wzuY, sum_wzu] = MoDT.sumFrames(Y, wzu, f_spkLim);
+    % Compare the outputs
+    abs_err_1 = abs(wzuY(:,:) - wzuY_ref(:,:));
+    norm_1 = sqrt(sum(wzuY_ref(:,:).^2,1));
+    err_1 = max(max(bsxfun(@rdivide, abs_err_1, norm_1)));
+    err_2 = max(abs(sum_wzu(:) - sum_wzu_ref(:)) ./ abs(sum_wzu_ref(:)));
+    if (err_1 > rel_err_thresh) || (err_2 > rel_err_thresh)
+        if ~failed
+            fprintf('FAIL\n');
+            failed = true;
+            fprintf('    Failed on the following problem:\n');
+            fprintf('    %21s | %18s\n', 'Dimensions      ','Relative error  ');
+            fprintf('    %2s  %7s  %2s  %4s | %8s  %8s\n', ...
+                'D','N','K','T','wzuY','sum_wzu');
+        end
+        fprintf('    %2d  %7d  %2d  %4d | %8.3g  %8.3g\n', D,N,K,T,err_1,err_2);
+    end
+end
+if failed
+    errmsg = sprintf('%s%s\n', errmsg, ...
+        'sumFrames : Excessive error on floating-point values');
+else
+    fprintf('PASS\n');
+end
+
+% 4. Let's measure the speedup on a slightly larger problem
+fprintf('%s','4. Measuring MEX file speedup: ');
 % Generate random inputs
 [D,N,K,T] = deal(12,1e6,20,720);
 Y = randn(D,N) + 2;
@@ -404,7 +446,7 @@ errmsg = '';
 % 1. It should give approximate results for double-precision floating point
 fprintf('%-68s','1. Testing on double-precision floating-point values');
 failed = false;
-rel_err_thresh = 1000 * eps;
+rel_err_thresh = 4*eps;
 for ii = 1:nTests
     [N,q,m] = deal(Nqm{ii,:});
     % Construct a random positive definite matrix via its Cholesky factorization
@@ -417,12 +459,13 @@ for ii = 1:nTests
     A_bands(i-j+q + p*(j-1)) = v;
     % Generate a random x and get b = A*x
     x = randn(N,m);
-    b = A * x;
+    b = full(A * x);
     % Call the routine under test
     x_mex = MoDT.bandPosSolve(A_bands, b);
     % Compare the outputs
-    norm_x = sqrt(sum(x.^2,1));
-    err_mex = max(max(abs(x_mex(:) - x(:)),[],1)./norm_x);
+    err_mex = max(abs(b - A*x_mex), [], 1);
+    norm_b = sqrt(sum(b.^2,1));
+    err_mex = max(err_mex ./ norm_b);
     if (err_mex > rel_err_thresh)
         if ~failed
             fprintf('FAIL\n');
@@ -441,8 +484,52 @@ else
     fprintf('PASS\n');
 end
 
-% 2. Let's measure the speedup on a slightly larger problem
-fprintf('%s','2. Measuring MEX file speedup: ');
+% 2. It should give approximate results on single-precision floating point
+fprintf('%-68s','2. Testing on single-precision floating-point values');
+failed = false;
+rel_err_thresh = 4*eps('single');
+for ii = 1:nTests
+    [N,q,m] = deal(Nqm{ii,:});
+    % Construct a random positive definite matrix via its Cholesky factorization
+    L = spdiags(randn(N,q), -q+1:0, N, N);
+    A = L*L' + 0.01*speye(N);
+    % Get its banded representation
+    p = 2*q-1;
+    A_bands = zeros(p,N);
+    [i,j,v] = find(A);
+    A_bands(i-j+q + p*(j-1)) = v;
+    % Generate a random x and get b = A*x
+    x = randn(N,m);
+    b = full(A * x);
+    % Convert to single-precision
+    A_bands = single(A_bands);
+    b = single(b);
+    % Call the routine under test
+    x_mex = MoDT.bandPosSolve(A_bands, b);
+    % Compare the outputs
+    err_mex = max(abs(double(b) - A*double(x_mex)), [], 1);
+    norm_b = sqrt(sum(double(b).^2,1));
+    err_mex = max(err_mex ./ norm_b);
+    if (err_mex > rel_err_thresh)
+        if ~failed
+            fprintf('FAIL\n');
+            failed = true;
+            fprintf('    Failed on the following problem:\n');
+            fprintf('    %12s | %8s\n', 'Dimensions ','Rel error');
+            fprintf('    %5s %3s %2s | %8s\n', 'N','p','m','x');
+        end
+        fprintf('    %5d %3d %2d | %8.3g\n',N,p,m,err_mex);
+    end
+end
+if failed
+    errmsg = sprintf('%s%s\n', errmsg, ...
+        'bandPosSolve : Excessive error on floating-point values');
+else
+    fprintf('PASS\n');
+end
+
+% 3. Let's measure the speedup on a slightly larger problem
+fprintf('%s','3. Measuring MEX file speedup: ');
 % Generate random inputs
 [N,q,m] = deal(8640, 24, 1);
 L = spdiags(randn(N,q), -q+1:0, N, N);
