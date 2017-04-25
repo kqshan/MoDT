@@ -20,11 +20,13 @@
  *     wzuY(:,:,t) = Y(:,n1:n2) * wzu(n1:n2,:);
  * end
  *
- * For small problems, (D < 32), this is performed in a custom kernel that
+ * For small problems, (D <= 32), this is performed in a custom kernel that
  * reduces the kernel launch overhead. For larger problems, this calls cuBLAS: 
  * GEMM for Y*wzu, and GEMV with a vector of ones for sum(wzu).
  * 
- * Kevin Shan, 2016-08-29
+ * Kevin Shan
+ * 2017-04-25  Add single-precision support
+ * 2016-08-29  Initial version
  *============================================================================*/
 
 #ifdef MATLAB_MEX_FILE
@@ -63,9 +65,10 @@
  *    wSum      [K x T] sum of the weights in each time frame
  */
 int const READ_BUFF_SZ = 16;
-__global__ void sumFrames( int const D, long const N, int const K, int const T, 
-        double const * __restrict__ spikes, double const * __restrict__ weights,
-        long const * __restrict__ spkLims, double *spkSum, double *wSum )
+template <typename numeric_t>
+__global__ void sumFrames( int const D, int const N, int const K, int const T, 
+        numeric_t const * __restrict__ spikes, numeric_t const * __restrict__ weights,
+        int const * __restrict__ spkLims, numeric_t *spkSum, numeric_t *wSum )
 {
     // Declare our dynamically-allocated shared memory
     extern __shared__ int S[];
@@ -81,18 +84,18 @@ __global__ void sumFrames( int const D, long const N, int const K, int const T,
     int const frameCount = min(framesPerBlk, T-frameOffset);
     if (frameCount <= 0) return;
     // And the spike range
-    long const spkOffset = spkLims[frameOffset];
+    int const spkOffset = spkLims[frameOffset];
     // Shift the pointers to account for these offsets
-    spikes += D*spkOffset;
-    weights += spkOffset + N*kOffset;
+    spikes += D*static_cast<ptrdiff_t>(spkOffset);
+    weights += spkOffset + static_cast<ptrdiff_t>(N)*kOffset;
     spkLims += frameOffset;
     spkSum += D*(kOffset + K*frameOffset);
     wSum += kOffset + K*frameOffset;
     // Lay out our shared memory
     int offset = 0;
-    double *spikeBuff = reinterpret_cast<double*> (S + offset);
+    numeric_t *spikeBuff = reinterpret_cast<numeric_t*> (S + offset);
     offset += D * READ_BUFF_SZ * sizeof(*spikeBuff)/sizeof(*S);
-    double *weightBuff = reinterpret_cast<double*> (S + offset);
+    numeric_t *weightBuff = reinterpret_cast<numeric_t*> (S + offset);
     offset += kPerBlk * READ_BUFF_SZ * sizeof(*weightBuff)/sizeof(*S);
     int *spkCounts = reinterpret_cast<int*> (S + offset);
     // Copy the spike counts into shared memory
@@ -103,9 +106,9 @@ __global__ void sumFrames( int const D, long const N, int const K, int const T,
     
     // Determine what this tread is responsible for computing
     bool threadHasValidCompute = false;
-    double *spkCompBuff, *wCompBuff, *outputTgt;
+    numeric_t *spkCompBuff, *wCompBuff, *outputTgt;
     int spkCompStride, outputStride;
-    double one = 1;
+    numeric_t one = 1;
     if (tIdx < D*kCount) {
         threadHasValidCompute = true;
         // Thread computes spkSum(d,k,t) = spikes(d,:) * weights(:,k)
@@ -135,7 +138,7 @@ __global__ void sumFrames( int const D, long const N, int const K, int const T,
     for (int frameIdx=0; frameIdx<frameCount; frameIdx++) {
         __syncthreads();
         int nSpkRemain = spkCounts[frameIdx];
-        double result_acc = 0;
+        numeric_t result_acc = 0;
         // About 98% of the time, we can load+compute a whole buffer at a time
         while (nSpkRemain >= READ_BUFF_SZ) {
             // Load from spikes
@@ -152,7 +155,7 @@ __global__ void sumFrames( int const D, long const N, int const K, int const T,
             // Compute spikes*weights and sum(weights)
             __syncthreads();
             if (threadHasValidCompute) {
-                double local_acc = 0;
+                numeric_t local_acc = 0;
                 for (int ii=0; ii<READ_BUFF_SZ; ii++)
                     local_acc += spkCompBuff[spkCompStride*ii] * wCompBuff[ii];
                 result_acc += local_acc;
@@ -176,7 +179,7 @@ __global__ void sumFrames( int const D, long const N, int const K, int const T,
         __syncthreads();
         if (threadHasValidCompute) {
             // Compute on the partial buffer
-            double local_acc = 0;
+            numeric_t local_acc = 0;
             for (int ii=0; ii<nSpkRemain; ii++)
                 local_acc += spkCompBuff[spkCompStride*ii] * wCompBuff[ii];
             result_acc += local_acc;
@@ -187,41 +190,30 @@ __global__ void sumFrames( int const D, long const N, int const K, int const T,
     }
 }
 
-/* Dummy version for single-precision. Needed for compilation but we should 
- * never call it during runtime.
- */
-__global__ void sumFrames( int const D, long const N, int const K, int const T, 
-        float const * __restrict__ spikes, float const * __restrict__ weights,
-        long const * __restrict__ spkLims, float *spkSum, float *wSum )
-{
-}
-
 
 /* Overload a single function for both single and double-precision data
  */
 cublasStatus_t gemm( 
         cublasHandle_t handle, cublasOperation_t ta, cublasOperation_t tb,
-        ptrdiff_t m, ptrdiff_t n, ptrdiff_t k, const double *alpha, 
-        const double *A, ptrdiff_t lda, const double *B, ptrdiff_t ldb, 
-        const double *beta, double *C, ptrdiff_t ldc )
+        int m, int n, int k, const double *alpha, 
+        const double *A, int lda, const double *B, int ldb, 
+        const double *beta, double *C, int ldc )
 {   return cublasDgemm(handle,ta,tb,m,n,k,alpha,A,lda,B,ldb,beta,C,ldc); }
 cublasStatus_t gemm( 
         cublasHandle_t handle, cublasOperation_t ta, cublasOperation_t tb,
-        ptrdiff_t m, ptrdiff_t n, ptrdiff_t k, const float *alpha, 
-        const float *A, ptrdiff_t lda, const float *B, ptrdiff_t ldb, 
-        const float *beta, float *C, ptrdiff_t ldc )
+        int m, int n, int k, const float *alpha, 
+        const float *A, int lda, const float *B, int ldb, 
+        const float *beta, float *C, int ldc )
 {   return cublasSgemm(handle,ta,tb,m,n,k,alpha,A,lda,B,ldb,beta,C,ldc); }
 cublasStatus_t gemv(
-        cublasHandle_t handle, cublasOperation_t trans, ptrdiff_t m, ptrdiff_t n,
-        const double *alpha, const double *A, ptrdiff_t lda, 
-        const double *x, ptrdiff_t incx,
-        const double *beta, double *y, ptrdiff_t incy)
+        cublasHandle_t handle, cublasOperation_t trans, int m, int n,
+        const double *alpha, const double *A, int lda, const double *x, int incx,
+        const double *beta, double *y, int incy)
 {   return cublasDgemv(handle,trans,m,n,alpha,A,lda,x,incx,beta,y,incy); }
 cublasStatus_t gemv(
-        cublasHandle_t handle, cublasOperation_t trans, ptrdiff_t m, ptrdiff_t n,
-        const float *alpha, const float *A, ptrdiff_t lda, 
-        const float *x, ptrdiff_t incx,
-        const float *beta, float *y, ptrdiff_t incy)
+        cublasHandle_t handle, cublasOperation_t trans, int m, int n,
+        const float *alpha, const float *A, int lda, const float *x, int incx,
+        const float *beta, float *y, int incy)
 {   return cublasSgemv(handle,trans,m,n,alpha,A,lda,x,incx,beta,y,incy); }
 
 
@@ -269,17 +261,17 @@ void mexErrMsgIdAndTxt(char const *errId, char const *errMsg)
  *    d_sumwzu  [K x T] sums of weights in each frame (on GPU device)
  */
 template <typename numeric_t>
-void computeFrameSums(ptrdiff_t D, ptrdiff_t N, ptrdiff_t K, ptrdiff_t T, 
-        numeric_t const *d_Y, numeric_t const *d_wzu, std::vector<ptrdiff_t> &fsLim0, 
+void computeFrameSums(int D, int N, int K, int T, 
+        numeric_t const *d_Y, numeric_t const *d_wzu, std::vector<int> &fsLim0, 
         numeric_t *d_wzuY, numeric_t *d_sumwzu)
 {
     // Validate the fsLim indices and get the max # spikes per frame
     char const * const errId = "MoDT:sumFramesGpu:InvalidInput";
-    ptrdiff_t maxCount = 0;
-    ptrdiff_t last_n2 = 0;
+    int maxCount = 0;
+    int last_n2 = 0;
     for (int t=0; t<T; t++) {
-        ptrdiff_t n1 = fsLim0[t];
-        ptrdiff_t n2 = fsLim0[t+T];
+        int n1 = fsLim0[t];
+        int n2 = fsLim0[t+T];
         // Check that the indices are valid
         if ((n1<0) || (n2<-1) || (n1>N) || (n2>=N) || (n2-n1 < -1))
             mexErrMsgIdAndTxt(errId, "Invalid frame spike limits");
@@ -293,14 +285,14 @@ void computeFrameSums(ptrdiff_t D, ptrdiff_t N, ptrdiff_t K, ptrdiff_t T,
     // Sum across time frames
     cudaError_t cudaStat;
     char const * const cudaErrId = "MoDT:sumFramesGpu:cudaError";
-    if ((D < 32) && std::is_same<double,numeric_t>::value) {
+    if (D <= 32) {
         /* For small problems, we have a custom kernel that will perform the for
          * loop over time frames, reducing the kernel launch overhead. */
         
         // Copy the fsLim indices to the GPU
-        ptrdiff_t *d_fsLim;
+        int *d_fsLim;
         cudaStat = cudaMalloc((void**)&d_fsLim, T*2*sizeof(d_fsLim));
-        std::unique_ptr<ptrdiff_t,CudaDeleter> cleanup_fsLim(d_fsLim);
+        std::unique_ptr<int,CudaDeleter> cleanup_fsLim(d_fsLim);
         if (cudaStat != cudaSuccess)
             mexErrMsgIdAndTxt(cudaErrId, "Failed to allocate CUDA memory");
         cudaStat = cudaMemcpyAsync(d_fsLim, fsLim0.data(), T*2*sizeof(d_fsLim), 
@@ -313,39 +305,42 @@ void computeFrameSums(ptrdiff_t D, ptrdiff_t N, ptrdiff_t K, ptrdiff_t T,
         cudaGetDevice(&deviceNo);
         cudaDeviceProp prop;
         cudaGetDeviceProperties(&prop, deviceNo);
-        // Figure out how many clusters we can do at once
-        int maxK_thread = prop.maxThreadsPerBlock / (D+1);
-        int maxK_mem = (prop.sharedMemPerBlock/2 - T*sizeof(d_fsLim)) / 
-                (READ_BUFF_SZ*sizeof(d_Y)) - D;
+        // Design for the worst-case scenario in terms of # frames per block
+        int maxT_eff = 64; // I decided this
+        // Figure out how many clusters we can do and still have 2 blocks per MP
+        int maxThreads = prop.maxThreadsPerMultiProcessor;
+        int maxK_thread = (maxThreads/2) / (D+1);
+        int maxMem = prop.sharedMemPerMultiprocessor;
+        int maxK_mem = ((maxMem/2) - maxT_eff*sizeof(d_fsLim))
+                       / (READ_BUFF_SZ*sizeof(d_Y)) - D;
         int maxK = std::min(maxK_thread, maxK_mem);
+        // If we can't do all of the clusters at once, try to spread them evenly
         int K_eff, grid_x;
-        if (maxK < K) {
-            // If we can't do them all at once, try to spread them evenly
-            grid_x = (K + maxK-1)/maxK;
-            K_eff = (K + grid_x-1)/grid_x;
-        } else {
-            // We can do all the clusters at once
+        if (maxK >= K) {
             grid_x = 1;
             K_eff = K;
+        } else {
+            grid_x = (K + maxK-1)/maxK;
+            K_eff = (K + grid_x-1)/grid_x;
         }
-        // Figure out how many threads per block
+        // This determines the threads per block and the memory usage
         int nWarps = (D*K_eff + K_eff + 31)/32;
         dim3 threadsPerBlock(32, nWarps);
-        // Figure out how many blocks in the grid
-        int blocksPerDevice = prop.multiProcessorCount * (maxK/K_eff);
-        int grid_y = std::min((int) T, 2*blocksPerDevice);
-        dim3 blocksPerGrid(grid_x, grid_y);
-        // Figure out how much memory per block
-        int T_eff = (T + grid_y-1)/grid_y;
         int memPerBlock = (D+K_eff)*READ_BUFF_SZ*sizeof(d_Y) + 
-                T_eff*sizeof(d_fsLim);
+                maxT_eff*sizeof(d_fsLim);
+        // Figure out how many blocks in the grid
+        int blocksPerMP = std::min(maxThreads/(64*nWarps), maxMem/memPerBlock);
+        int grid_y = 2 * prop.multiProcessorCount * blocksPerMP;
+        grid_y = std::max(grid_y, (T+maxT_eff-1)/maxT_eff);
+        grid_y = std::min(grid_y, T);
+        dim3 blocksPerGrid(grid_x, grid_y);
         
         // Launch the kernel
         sumFrames<<<blocksPerGrid, threadsPerBlock, memPerBlock>>>
                 (D, N, K, T, d_Y, d_wzu, d_fsLim, d_wzuY, d_sumwzu);
         
     } else {
-        /* For larger problems (or single-precision), we turn to cuBLAS */
+        /* For larger problems, we turn to cuBLAS */
         
         // Initialize the cuBLAS context
         cublasHandle_t handle;
@@ -372,7 +367,7 @@ void computeFrameSums(ptrdiff_t D, ptrdiff_t N, ptrdiff_t K, ptrdiff_t T,
         // For loop over time frames
         for (int t=0; t<T; t++) {
             // Get the first spike index and spike count for this time frame
-            ptrdiff_t n1 = fsLim0[t];
+            int n1 = fsLim0[t];
             int spkCount = (int) (fsLim0[t+T] - fsLim0[t] + 1);
             if (spkCount <= 0) continue;
             // Call cublasDgemm to get wzuY(:,:,t) = Y(:,n1:n2) * wzu(n1:n2,:)
@@ -424,8 +419,8 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[])
             !((numericType==mxDOUBLE_CLASS) || (numericType==mxSINGLE_CLASS)))
         mexErrMsgIdAndTxt(errId, "Y must a 2-D real gpuArray");
     size_t const *dims = mxGPUGetDimensions( mgpu_Y );
-    ptrdiff_t D = static_cast<ptrdiff_t>(dims[0]);
-    ptrdiff_t N = static_cast<ptrdiff_t>(dims[1]);
+    int D = dims[0];
+    int N = dims[1];
     // wzu (weights) = input 1
     mxArray const *mx_wzu = prhs[1];
     if (!mxIsGPUArray(mx_wzu))
@@ -437,21 +432,21 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[])
             (mxGPUGetClassID(mgpu_wzu)!=numericType))
         mexErrMsgIdAndTxt(errId, "wzu must a 2-D gpuArray of the same type as Y");
     dims = mxGPUGetDimensions( mgpu_wzu );
-    ptrdiff_t N_wzu = static_cast<ptrdiff_t>(dims[0]);
-    ptrdiff_t K = dims[1];
+    int N_wzu = dims[0];
+    int K = dims[1];
     if (N_wzu != N)
         mexErrMsgIdAndTxt(errId, "wzu must be a [N x K] gpuArray");
     // fsLim (frame spike limits) = input 2
     mxArray const *mx_fsLim = prhs[2];
-    ptrdiff_t T = mxGetM(mx_fsLim);
+    int T = mxGetM(mx_fsLim);
     if (!mxIsDouble(mx_fsLim) || (T==0) || (mxGetN(mx_fsLim)!=2))
         mexErrMsgIdAndTxt(errId, "f_spklim must be a [T x 2] array of doubles");
     double const *fsLim = mxGetPr(mx_fsLim);
     
     // Copy the fsLim indices to a vector of 0-indexed integers
-    std::vector<ptrdiff_t> fsLim0(T*2);
+    std::vector<int> fsLim0(T*2);
     std::transform(fsLim, fsLim+2*T, fsLim0.begin(), 
-            [](double matlabIdx){ return ((ptrdiff_t) matlabIdx)-1; });
+            [](double matlabIdx){ return ((int) matlabIdx)-1; });
     
     // Allocate memory for the outputs
     std::vector<size_t> dims_wzuY = {(size_t)D, (size_t)K, (size_t)T};
@@ -488,12 +483,12 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[])
 #else
 
 template <typename numeric_t>
-void demo_sumFrames(ptrdiff_t D, ptrdiff_t N, ptrdiff_t K, ptrdiff_t T)
+void demo_sumFrames(int D, int N, int K, int T)
 {
     // Create the data
     thrust::device_vector<numeric_t> Y(D*N,1);
     thrust::device_vector<numeric_t> wzu(N*K,1);
-    std::vector<ptrdiff_t> fsLim(T*2);
+    std::vector<int> fsLim(T*2);
     for (int t=0; t<T; t++) {
         fsLim[t]   = (t*N)/T;         // fsLim[t,0] = first in frame
         fsLim[t+T] = ((t+1)*N)/T - 1; // fsLim[t,1] = last in frame
@@ -516,7 +511,7 @@ void demo_sumFrames(ptrdiff_t D, ptrdiff_t N, ptrdiff_t K, ptrdiff_t T)
 int main(int argc, char* argv[])
 {
     // Define the sizes
-    ptrdiff_t D=12, N=500000, K=25, T=100;
+    int D=12, N=500000, K=25, T=100;
     bool use_single = false;
     int c;
     while ( (c = getopt(argc,argv,"D:N:K:T:s")) != -1 ) {
