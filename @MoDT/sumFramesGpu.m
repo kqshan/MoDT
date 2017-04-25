@@ -26,8 +26,9 @@ D = size(Y,1);
 K = size(wzu,2);
 T = size(f_spklim,1);
 % Allocate memory
-wzuY = zeros(D, K, T, 'gpuArray');
-sum_wzu = zeros(K, T, 'gpuArray');
+datatype = classUnderlying(Y);
+wzuY = gpuArray.zeros(D, K, T, datatype);
+sum_wzu = gpuArray.zeros(K, T, datatype);
 
 % For loop over time frames
 for t = 1:T

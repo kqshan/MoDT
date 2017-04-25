@@ -8,8 +8,8 @@
  *   L       [D x D] lower triangular Cholesky-factorized covariance matrix
  *   X       [D x N] data matrix (gpuArray)
  * 
- * This function requires all matrices to be double-precision. There may be some
- * issues if X contains more than 2 billion (2^31) elements.
+ * L and X may be single- or double-precision, but they must be the same type.
+ * There may be some issues if X contains more than 2 billion (2^31) elements.
  * 
  * For D <= 28, this uses a custom CUDA kernel that multiplies the matrices and
  * computes the squared norm, without requiring intermediate storage.
@@ -19,8 +19,10 @@
  *============================================================================*/
 
 #ifdef MATLAB_MEX_FILE
-#include "mex.h"
-#include "gpu/mxGPUArray.h"
+    #include "mex.h"
+    #include "gpu/mxGPUArray.h"
+#else
+    #include <unistd.h>
 #endif
 
 #include <cuda_runtime.h>
@@ -54,6 +56,14 @@ __device__ double dblShfl_down(double var, unsigned int delta, int width=32)
     int lo = __shfl_down( __double2loint(var), delta, width );
     return __hiloint2double( hi, lo );
 }
+
+/* And then we added single-precision support, but I don't want to rename all
+ * the function calls just yet, so now we have dblShfl overloaded for float. */
+__device__ double dblShfl(float var, int srcLane, int width=32)
+{   return __shfl( var, srcLane, width );   }
+
+__device__ double dblShfl_down(float var, unsigned int delta, int width=32)
+{   return __shfl_down(var, delta, width);  }
 #endif
 
 
@@ -204,6 +214,7 @@ public:
     int sharedMemPerBlock;          // Shared memory required (Bytes)
     std::vector<WarpTask> taskList; // [nTask] list of WarpTasks to perform
     KernelPlan(int, double const *);// Constructor
+    KernelPlan(int D, float const*) : KernelPlan(D, (double*) nullptr) {} // Dummy for template
 };
 /* KernelPlan constructor */
 KernelPlan::KernelPlan(int D, double const *L)
@@ -507,6 +518,13 @@ __global__ void triSolveNorm( int const D, int const N,
     }
 }
 
+/* Dummy version of this because there is no static_if */
+__global__ void triSolveNorm( int const D, int const N, 
+        float const * __restrict__ X, KernelPlanOnDevice * plan, 
+        float * sqNorm )
+{
+}
+
 
 /* sumSqCols - CUDA kernel for computing the squared 2-norm over columns of A
  *
@@ -523,15 +541,16 @@ __global__ void triSolveNorm( int const D, int const N,
  *   b       [N] output vector; b = sum(A.^2,1)
  */
 int const sumSqCols_blockDim_y = 16; // Easier if known at compile time
+template <typename numeric_t>
 __global__ void sumSqCols( int const D, int const N, 
-        double const * __restrict__ A, double * b )
+        numeric_t const * __restrict__ A, numeric_t * b )
 {
     // Shared memory helps us coalesce the writes
     #if __CUDA_ARCH__ >= 300
-    __shared__ double S[sumSqCols_blockDim_y];
+    __shared__ numeric_t S[sumSqCols_blockDim_y];
     #else
-    __shared__ double S[sumSqCols_blockDim_y*33];
-    double volatile * S_sum = S + (threadIdx.y+1)*32;
+    __shared__ numeric_t S[sumSqCols_blockDim_y*33];
+    numeric_t volatile * S_sum = S + (threadIdx.y+1)*32;
     #endif
     // Some dimension-related constants
     int const linearIdx = threadIdx.x + threadIdx.y*blockDim.x;
@@ -542,14 +561,14 @@ __global__ void sumSqCols( int const D, int const N,
     int const yStride = gridDim.x * P;
     for (int readOffset=yStart; readOffset<N; readOffset+=yStride) {
         // Compute the sum over this column
-        double running_sum = 0;
+        numeric_t running_sum = 0;
         int readIdx_y = threadIdx.y + readOffset;
         if (readIdx_y < N) {
             // For loop over the rows, 32 at a time
             /* No need to synchronize because each y belongs to a single warp */
             for (int readIdx_x=threadIdx.x; readIdx_x<D_eff; readIdx_x+=32) {
                 // Read and square the data
-                double value;
+                numeric_t value;
                 value = (readIdx_x<D) ? A[readIdx_x+readIdx_y*D] : 0;
                 value *= value;
                 // Reduce across rows, noting that they belong to the same warp
@@ -587,6 +606,19 @@ void mexErrMsgIdAndTxt(char const *errId, char const *errMsg)
 #endif
 
 
+/* Overload a single function for both single and double-precision data
+ */
+cublasStatus_t trsm( 
+        cublasHandle_t handle, cublasSideMode_t side, cublasFillMode_t uplo,
+        cublasOperation_t trans, cublasDiagType_t diag, int m, int n,
+        const double *alpha, const double *A, int lda, double *B, int ldb )
+{   return cublasDtrsm(handle,side,uplo,trans,diag,m,n,alpha,A,lda,B,ldb); }
+cublasStatus_t trsm( 
+        cublasHandle_t handle, cublasSideMode_t side, cublasFillMode_t uplo,
+        cublasOperation_t trans, cublasDiagType_t diag, int m, int n,
+        const float *alpha, const float *A, int lda, float *B, int ldb )
+{   return cublasStrsm(handle,side,uplo,trans,diag,m,n,alpha,A,lda,B,ldb); }
+
 /* Main routine for computing the Mahalanobis distance
  * 
  * Inputs:
@@ -597,11 +629,12 @@ void mexErrMsgIdAndTxt(char const *errId, char const *errMsg)
  % Outputs:
  *    d_delta   [N] squared Mahalanobis distances (on GPU device)
  */
+template <typename numeric_t>
 void computeMahalDist(size_t D, size_t N, 
-        double const *L, double const *d_X, double *d_delta)
+        numeric_t const *L, numeric_t const *d_X, numeric_t *d_delta)
 {
     char const * const cudaErrId = "MoDT:calcMahalDistGpu:cudaError";
-    if (D <= 28) {
+    if ((D <= 28) && std::is_same<double,numeric_t>::value) {
         /* We have a kernel that performs a triangular solve and computes the
          * squared norm of each column, and it's optimized for small matrices */
         // I should have thought more carefully about where to use ints...
@@ -626,7 +659,8 @@ void computeMahalDist(size_t D, size_t N,
         cudaDeviceSynchronize();
     } 
     else {
-        /* For larger D, our kernel runs out of shared memory, so use cuBLAS */
+        /* For larger D, our kernel runs out of shared memory, so use cuBLAS 
+         * Also, use cuBLAS for single precision */
         cublasStatus_t cublasStat;
         cudaError_t cudaStat;
         cublasHandle_t handle;
@@ -636,18 +670,18 @@ void computeMahalDist(size_t D, size_t N,
         if (cublasStat != CUBLAS_STATUS_SUCCESS)
             mexErrMsgIdAndTxt(cudaErrId, "Unable to initialize cuBLAS context");
         // Move L to the device
-        double *d_L;
+        numeric_t *d_L;
         cudaStat = cudaMalloc((void**)&d_L, D*D*sizeof(*L));
-        std::unique_ptr<double,CudaDeleter> cleanup_L(d_L);
+        std::unique_ptr<numeric_t,CudaDeleter> cleanup_L(d_L);
         if (cudaStat != cudaSuccess)
             mexErrMsgIdAndTxt(cudaErrId, "Failed to allocate CUDA memory");
         cublasStat = cublasSetMatrix(D, D, sizeof(*L), L, D, d_L, D);
         if (cublasStat != CUBLAS_STATUS_SUCCESS)
             mexErrMsgIdAndTxt(cudaErrId, "cuBLAS error copying L to GPU");
         // Copy X because it'll be overwritten by TRSM
-        double *d_X_copy;
+        numeric_t *d_X_copy;
         cudaStat = cudaMalloc((void**)&d_X_copy, D*N*sizeof(*d_X));
-        std::unique_ptr<double,CudaDeleter> cleanup_X_copy(d_X_copy);
+        std::unique_ptr<numeric_t,CudaDeleter> cleanup_X_copy(d_X_copy);
         if (cudaStat != cudaSuccess)
             mexErrMsgIdAndTxt(cudaErrId, "Failed to allocate CUDA memory");
         cudaStat = cudaMemcpy(d_X_copy, d_X, D*N*sizeof(*d_X), 
@@ -655,8 +689,8 @@ void computeMahalDist(size_t D, size_t N,
         if (cudaStat != cudaSuccess)
             mexErrMsgIdAndTxt(cudaErrId, "Failed to make copy of X");
         // Call TRSM
-        double const alpha = 1;     // Scaling applied to X
-        cublasStat = cublasDtrsm( handle, CUBLAS_SIDE_LEFT, 
+        numeric_t const alpha = 1;     // Scaling applied to X
+        cublasStat = trsm( handle, CUBLAS_SIDE_LEFT, 
                 CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N, CUBLAS_DIAG_NON_UNIT, 
                 D, N, &alpha, d_L, D, d_X_copy, D );
         if (cublasStat != CUBLAS_STATUS_SUCCESS)
@@ -670,6 +704,20 @@ void computeMahalDist(size_t D, size_t N,
 
 
 #ifdef MATLAB_MEX_FILE
+/* Some MATLAB helpers because these function names are ridiculous
+ */
+template <typename numeric_t>
+numeric_t const * gpuPtr(mxGPUArray const *mgpu_X)
+{   return static_cast<numeric_t const*>(mxGPUGetDataReadOnly(mgpu_X)); }
+template <typename numeric_t>
+numeric_t * gpuPtr(mxGPUArray *mgpu_X)
+{   return static_cast<numeric_t*>(mxGPUGetData(mgpu_X)); }
+template <typename numeric_t>
+numeric_t * mxPtr(mxArray *mx_X)
+{   return static_cast<numeric_t*>(mxGetData(mx_X)); }
+template <typename numeric_t>
+numeric_t const * mxPtr(mxArray const *mx_X)
+{   return static_cast<numeric_t const*>(mxGetData(mx_X)); }
 /* Main entry point into this mex file
  * Inputs and outputs are arrays of mxArray pointers
  */
@@ -684,9 +732,10 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[])
     if (mxIsGPUArray(mx_L))
         mexErrMsgIdAndTxt(errId, "L should not be a gpuArray");
     size_t D = mxGetM(mx_L);
-    if ((D==0) || (D!=mxGetN(mx_L)) || !mxIsDouble(mx_L))
-        mexErrMsgIdAndTxt(errId, "L must be a square double-precision matrix");
-    double const *L = mxGetPr(mx_L);
+    mxClassID numericType = mxGetClassID(mx_L);
+    if ((D==0) || (D!=mxGetN(mx_L)) || 
+            !((numericType==mxDOUBLE_CLASS) || (numericType==mxSINGLE_CLASS)) )
+        mexErrMsgIdAndTxt(errId, "L must be a square real matrix");
     // X = input 1
     mxArray const *mx_X = prhs[1];
     if (!mxIsGPUArray(mx_X))
@@ -695,23 +744,29 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[])
     mxGPUArrayCleanupWrapper cleanup_X(mgpu_X);
     if ((mxGPUGetNumberOfElements(mgpu_X)==0) || 
             (mxGPUGetNumberOfDimensions(mgpu_X)!=2) ||
-            (mxGPUGetClassID(mgpu_X)!=mxDOUBLE_CLASS))
-        mexErrMsgIdAndTxt(errId, "X must a 2-D double-precision array");
+            (mxGPUGetClassID(mgpu_X)!=numericType))
+        mexErrMsgIdAndTxt(errId, "X must a 2-D array of the same type as L");
     size_t const *dims = mxGPUGetDimensions( mgpu_X );
     if (dims[0] != D)
         mexErrMsgIdAndTxt(errId, "X must be a [D x N] gpuArray");
     size_t N = dims[1];
-    double const *d_X = (double const *) mxGPUGetDataReadOnly( mgpu_X );
     
     // Allocate memory for the output
-    size_t dims_delta[2] = {N, 1};
-    mxGPUArray *mgpu_delta = mxGPUCreateGPUArray(2, dims_delta, 
-            mxDOUBLE_CLASS, mxREAL, MX_GPU_DO_NOT_INITIALIZE);
+    std::vector<size_t> dims_delta = {N, 1};
+    mxGPUArray *mgpu_delta = mxGPUCreateGPUArray(2, dims_delta.data(),
+            numericType, mxREAL, MX_GPU_DO_NOT_INITIALIZE);
     mxGPUArrayCleanupWrapper cleanup_delta(mgpu_delta);
-    double *d_delta = (double *) mxGPUGetData(mgpu_delta);
-    
     // Compute delta = sum((L\X).^2,1)'
-    computeMahalDist(D, N, L, d_X, d_delta);
+    switch (numericType) {
+        case mxDOUBLE_CLASS:
+            computeMahalDist(D, N, mxPtr<double>(mx_L), gpuPtr<double>(mgpu_X),
+                             gpuPtr<double>(mgpu_delta) );
+            break;
+        case mxSINGLE_CLASS:
+            computeMahalDist(D, N, mxPtr<float>(mx_L), gpuPtr<float>(mgpu_X),
+                             gpuPtr<float>(mgpu_delta) );
+            break;
+    }
     
     // Output 0 = delta
     if (nlhs >= 1) {
@@ -724,27 +779,45 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[])
 
 #else
 
+template <typename numeric_t>
+void demo_mahalDist(ptrdiff_t D, ptrdiff_t N)
+{
+    // Create the data
+    thrust::device_vector<numeric_t> X(D*N,1);
+    thrust::device_vector<numeric_t> delta(N,1);
+    std::vector<numeric_t> L(D*D,0);
+    for (int i=0; i<D; i++)
+        L[i+D*i] = 1;    
+    // Extract the raw pointers
+    numeric_t *d_X = thrust::raw_pointer_cast(X.data());
+    numeric_t *d_delta = thrust::raw_pointer_cast(delta.data());
+    numeric_t *h_L = L.data();
+    // Compute delta = sum((L\X).^2,1)'
+    computeMahalDist(D, N, h_L, d_X, d_delta);
+}    
+
+
 /* Main entry point if this is compiled externally (i.e. not as a MEX file)
  * This sets up and runs a simple example program and is suitable for benchmarking
  */
 int main(int argc, char* argv[])
 {
     // Define the sizes
-    size_t D = (argc > 1) ? (size_t) std::atoi(argv[1]) : 12;
-    size_t N = (argc > 2) ? (size_t) std::atoi(argv[2]) : 500000;
-    // Create the data
-    thrust::device_vector<double> X(D*N,1);
-    thrust::device_vector<double> delta(N,1);
-    std::vector<double> L(D*D,0);
-    for (int i=0; i<D; i++)
-        L[i+D*i] = 1;    
-    // Extract the raw pointers
-    double *d_X = thrust::raw_pointer_cast(X.data());
-    double *d_delta = thrust::raw_pointer_cast(delta.data());
-    double *h_L = L.data();
-    
-    // Compute delta = sum((L\X).^2,1)'
-    computeMahalDist(D, N, h_L, d_X, d_delta);
+    ptrdiff_t D=12, N=500000;
+    bool use_single = false;
+    int c;
+    while ( (c = getopt(argc,argv,"D:N:s")) != -1 ) {
+        switch (c) {
+            case 'D': D = std::atoi(optarg); break; 
+            case 'N': N = std::atoi(optarg); break; 
+            case 's': use_single = true;    break;
+        }
+    }
+    // Call the appropriate demo type
+    if (use_single)
+        demo_mahalDist<float>(D, N);
+    else
+        demo_mahalDist<double>(D, N);
 }
 
 #endif

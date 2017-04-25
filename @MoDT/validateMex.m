@@ -403,8 +403,54 @@ else
     fprintf('PASS\n');
 end
 
-% 3. Let's measure the speedup on a slightly larger problem
-fprintf('%s','3. Measuring GPU+MEX speedup: ');
+% 3. It should give approximate results for double-precision floating point
+fprintf('%-68s','3. Testing on single-precision floating-point values');
+failed = false;
+rel_err_thresh = 1e-4;
+for ii = 1:nTests
+    [D,N,K,T] = deal(DNKT{ii,:});
+    % Generate random inputs
+    Y = randn(D,N) + 2;
+    wzu = rand(N,K);
+    frame_edge = sort(randi(N+1,[T-1, 1]))-1;
+    f_spkLim = [[1; frame_edge+1], [frame_edge; N]];
+    % Convert to single-precision
+    Y = single(Y);
+    wzu = single(wzu);
+    % Call the non-MEX CPU version to get the correct answer
+    [wzuY_ref, sum_wzu_ref] = sumFrames(Y, wzu, f_spkLim);
+    % Call the MEX version
+    Y_gpu = gpuArray(Y);
+    wzu_gpu = gpuArray(wzu);
+    [wzuY_gpu, sum_wzu_gpu] = MoDT.sumFramesGpu(Y_gpu, wzu_gpu, f_spkLim);
+    wzuY = gather(wzuY_gpu);
+    sum_wzu = gather(sum_wzu_gpu);
+    % Compare the outputs
+    abs_err_1 = abs(wzuY(:,:) - wzuY_ref(:,:));
+    norm_1 = sqrt(sum(wzuY_ref(:,:).^2,1));
+    err_1 = max(max(bsxfun(@rdivide, abs_err_1, norm_1)));
+    err_2 = max(abs(sum_wzu(:) - sum_wzu_ref(:)) ./ abs(sum_wzu_ref(:)));
+    if (err_1 > rel_err_thresh) || (err_2 > rel_err_thresh)
+        if ~failed
+            fprintf('FAIL\n');
+            failed = true;
+            fprintf('    Failed on the following problem:\n');
+            fprintf('    %21s | %18s\n', 'Dimensions      ','Relative error  ');
+            fprintf('    %2s  %7s  %2s  %4s | %8s  %8s\n', ...
+                'D','N','K','T','wzuY','sum_wzu');
+        end
+        fprintf('    %2d  %7d  %2d  %4d | %8.3g  %8.3g\n', D,N,K,T,err_1,err_2);
+    end
+end
+if failed
+    errmsg = sprintf('%s%s\n', errmsg, ...
+        'sumFramesGpu : Excessive error on floating-point values');
+else
+    fprintf('PASS\n');
+end
+
+% 4. Let's measure the speedup on a slightly larger problem
+fprintf('%s','4. Measuring GPU+MEX speedup: ');
 % Generate random inputs
 [D,N,K,T] = deal(12,1e6,20,720);
 Y = randn(D,N) + 2;
@@ -577,7 +623,7 @@ errmsg = '';
 % 1. It should give approximate results for double-precision floating point
 fprintf('%-68s','1. Testing on double-precision floating-point values');
 failed = false;
-rel_err_thresh = 1000 * eps;
+rel_err_thresh = (sqrt([DNK{:,2}]) + 2) * eps;
 for ii = 1:nTests
     [D,N,K] = deal(DNK{ii,:});
     % Generate random inputs
@@ -594,11 +640,11 @@ for ii = 1:nTests
     C = gather(C_gpu);
     % Compare the outputs
     abs_err = max(abs(C(:) - C_ref(:)));
-    C_norm = min(eig(C_ref));
+    C_norm = max(eig(C_ref));
     err = abs_err / C_norm;
     symm_err = C - C';
     symm_err = max(abs(symm_err(:))) / C_norm;
-    if (err > rel_err_thresh) || (symm_err > 0)
+    if (err > rel_err_thresh(ii)) || (symm_err > 0)
         if ~failed
             fprintf('FAIL\n');
             failed = true;
@@ -616,8 +662,54 @@ else
     fprintf('PASS\n');
 end
 
-% 2. Let's measure the speedup on a slightly larger problem
-fprintf('%s','2. Measuring GPU+MEX speedup: ');
+% 2. It should give approximate results for single-precision floating point
+fprintf('%-68s','2. Testing on single-precision floating-point values');
+failed = false;
+rel_err_thresh = (sqrt([DNK{:,2}]) + 2) * eps('single');
+for ii = 1:nTests
+    [D,N,K] = deal(DNK{ii,:});
+    % Generate random inputs
+    A = randn(D,N);
+    W = rand(N,K);
+    k = randi(K);
+    % Define the correct answer (in double precision)
+    A_scaled = bsxfun(@times, A, sqrt(W(:,k))');
+    C_ref = A_scaled*A_scaled';
+    % Convert to single precision
+    C_ref = single(C_ref);
+    A = single(A);
+    W = single(W);
+    % Call the MEX version
+    A_gpu = gpuArray(A);
+    W_gpu = gpuArray(W);
+    C_gpu = MoDT.weightCovGpu(A_gpu, W_gpu, k);
+    C = gather(C_gpu);
+    % Compare the outputs
+    abs_err = max(abs(C(:) - C_ref(:)));
+    C_norm = max(eig(C_ref));
+    err = abs_err / C_norm;
+    symm_err = C - C';
+    symm_err = max(abs(symm_err(:))) / C_norm;
+    if (err > rel_err_thresh(ii)) || (symm_err > 0)
+        if ~failed
+            fprintf('FAIL\n');
+            failed = true;
+            fprintf('    Failed on the following problem:\n');
+            fprintf('    %15s | %18s\n', 'Dimensions   ','Error       ');
+            fprintf('    %2s  %7s  %2s | %8s  %8s\n', 'D','N','K','C','C-C''');
+        end
+        fprintf('    %2d  %7d  %2d | %8.3g  %8.3g\n', D,N,K,err,symm_err);
+    end
+end
+if failed
+    errmsg = sprintf('%s%s\n', errmsg, ...
+        'weightCovGpu : Excessive error on floating-point values');
+else
+    fprintf('PASS\n');
+end
+
+% 3. Let's measure the speedup on a slightly larger problem
+fprintf('%s','3. Measuring GPU+MEX speedup: ');
 % Generate random inputs
 D = 12; N = 1e6;
 A = randn(D,N);
@@ -695,8 +787,47 @@ else
     fprintf('PASS\n');
 end
 
-% 2. Let's measure the speedup on a slightly larger problem
-fprintf('%s','2. Measuring GPU+MEX speedup: ');
+% 2. It should give approximate results for single-precision floating point
+fprintf('%-68s','2. Testing on single-precision floating-point values');
+failed = false;
+rel_err_thresh = 50 * eps('single');
+for ii = 1:nTests
+    [D,N] = deal(DN{ii,:});
+    % Generate random inputs
+    A = randn(D,N);
+    L = chol(cov(randn(4*D,D)),'lower');
+    X = L*A;
+    % Define the correct answer
+    delta_ref = sum(A.^2,1)';
+    % Convert to single-precision
+    L = single(L); X = single(X);
+    % Call the GPU+MEX version
+    X_gpu = gpuArray(X);
+    delta_gpu = MoDT.calcMahalDistGpu(L, X_gpu);
+    delta = gather(delta_gpu);
+    % Compare the outputs
+    abs_err = max(abs(double(delta(:)) - delta_ref(:)));
+    err = abs_err / D;
+    if (err > rel_err_thresh)
+        if ~failed
+            fprintf('FAIL\n');
+            failed = true;
+            fprintf('    Failed on the following problem:\n');
+            fprintf('    %11s | %8s\n', 'Dimensions ','Error  ');
+            fprintf('    %2s  %7s | %8s\n', 'D','N','delta');
+        end
+        fprintf('    %2d  %7d | %8.3g\n', D,N,err);
+    end
+end
+if failed
+    errmsg = sprintf('%s%s\n', errmsg, ...
+        'calcMahaldistGpu : Excessive error on floating-point values');
+else
+    fprintf('PASS\n');
+end
+
+% 3. Let's measure the speedup on a slightly larger problem
+fprintf('%s','3. Measuring GPU+MEX speedup: ');
 % Generate random inputs
 D = 12; N = 1e6;
 L = chol(cov(randn(4*D,D)),'lower');

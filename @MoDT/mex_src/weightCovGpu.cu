@@ -9,7 +9,8 @@
  *   weights [N x K] gpuArray
  *   k       Cluster index (1..K)
  * 
- * This function requires all gpuArrays to be double-precision. 
+ * A and weights can be either single- or double-precision, but they both must
+ * be the same type. The output is returned in that type as well.
  * 
  * When D < 32, this optimizes the data access by breaking A into chunks, using
  * a custom CUDA kernel to compute the weighted covariance independently for
@@ -21,8 +22,10 @@
  *============================================================================*/
 
 #ifdef MATLAB_MEX_FILE
-#include "mex.h"
-#include "gpu/mxGPUArray.h"
+    #include "mex.h"
+    #include "gpu/mxGPUArray.h"
+#else
+    #include <unistd.h>
 #endif
 
 #include <cuda_runtime.h>
@@ -55,7 +58,8 @@ __global__ void calcWeightedCov(
         int const D, int const N, double const *A, double const *w, double *C)
 {
     // Dynamically-allocated shared memory, length = (D+1)*32
-    extern __shared__ double S[];
+    extern __shared__ __align__(sizeof(int4)) unsigned char shared_mem[];
+    double *S = reinterpret_cast<double*>(shared_mem);
     double *w_buff = S;                // [32 x 1] buffer for weights
     double *A_buff = S + READ_BUFF_SZ; // [D x 32] buffer for data matrix
     
@@ -132,6 +136,14 @@ __global__ void calcWeightedCov(
     }
 }
 
+/* Dummy version for single-precision. Needed for compilation but we should 
+ * never call it during runtime.
+ */
+__global__ void calcWeightedCov(
+        int const D, int const N, float const *A, float const *w, float *C)
+{
+}
+
 
 /* CUDA kernel for summing across the columns of X
  *
@@ -145,14 +157,15 @@ __global__ void calcWeightedCov(
  * Outputs
  *    Y         [rows x 1] data vector
  */
+template <typename numeric_t>
 __global__ void sumColumns( int const nRows, int const nCols, 
-        double const * __restrict__ X, double *Y )
+        numeric_t const * __restrict__ X, numeric_t *Y )
 {
     // Check if this thread falls in range
     int const row = threadIdx.x + blockIdx.x*blockDim.x;
     if (row < nRows) {
         // For loop to sum over columns
-        double result_acc = 0;
+        numeric_t result_acc = 0;
         for (int col=0; col<nCols; col++)
             result_acc += X[row+col*nRows];
         // Write to output
@@ -175,11 +188,13 @@ __global__ void sumColumns( int const nRows, int const nCols,
  * Outputs:
  *    B     [D x N] scaled data matrix
  */
+template <typename numeric_t>
 __global__ void sqrtScaledCopy(int D, int N, 
-        double const *A, double const *w, double *B)
+        numeric_t const *A, numeric_t const *w, numeric_t *B)
 {
     // Dynamically-allocated shared memory
-    extern __shared__ double S[];
+    extern __shared__ __align__(sizeof(int4)) unsigned char shared_mem[];
+    numeric_t *S = reinterpret_cast<numeric_t*>(shared_mem);
     // Notational convenience for some dimensions
     int tIdx = threadIdx.x;
     int P = blockDim.x;
@@ -204,6 +219,22 @@ __global__ void sqrtScaledCopy(int D, int N,
         __syncthreads();
     }
 }
+
+
+/* Overload a single function for both single and double-precision data
+ */
+cublasStatus_t gemm( 
+        cublasHandle_t handle, cublasOperation_t ta, cublasOperation_t tb,
+        ptrdiff_t m, ptrdiff_t n, ptrdiff_t k, const double *alpha, 
+        const double *A, ptrdiff_t lda, const double *B, ptrdiff_t ldb, 
+        const double *beta, double *C, ptrdiff_t ldc )
+{   return cublasDgemm(handle,ta,tb,m,n,k,alpha,A,lda,B,ldb,beta,C,ldc); }
+cublasStatus_t gemm( 
+        cublasHandle_t handle, cublasOperation_t ta, cublasOperation_t tb,
+        ptrdiff_t m, ptrdiff_t n, ptrdiff_t k, const float *alpha, 
+        const float *A, ptrdiff_t lda, const float *B, ptrdiff_t ldb, 
+        const float *beta, float *C, ptrdiff_t ldc )
+{   return cublasSgemm(handle,ta,tb,m,n,k,alpha,A,lda,B,ldb,beta,C,ldc); }
 
 
 /* Simple wrapper classes so we can do RAII-style cleanup 
@@ -241,11 +272,12 @@ void mexErrMsgIdAndTxt(char const *errId, char const *errMsg)
  * Outputs:
  *    d_C       [D x D] covariance matrix
  */
+template <typename numeric_t>
 void computeWeightedCov(size_t D, size_t N, 
-        double const * d_A, double const * d_w, double * d_C)
+        numeric_t const * d_A, numeric_t const * d_w, numeric_t * d_C)
 {
     char const * const cudaErrId = "MoDT:weightCovGpu:cudaError";
-    if (D < 32) {
+    if ((D < 32) && std::is_same<double,numeric_t>::value) {
         /* When D is small, we can improve GPU utilization by breaking X into
          * batches, computing the weighted covariance of each batch, and then
          * summing across the batches. */
@@ -275,7 +307,7 @@ void computeWeightedCov(size_t D, size_t N,
         int numBlocks = std::min( (int)(N/1024)+1, blocksPerMP*numMPs );
         
         // Allocate memory for the outputs
-        double *d_CBatched;
+        numeric_t *d_CBatched;
         cudaError_t cudaStat = cudaMalloc((void**)&d_CBatched, 
                 D*D*numBlocks*sizeof(*d_CBatched));
         if (cudaStat != cudaSuccess)
@@ -290,7 +322,7 @@ void computeWeightedCov(size_t D, size_t N,
         cudaFree(d_CBatched);
     }
     else {
-        /* For larger D, we'll use cuBLAS.
+        /* For larger D (or single precision), we'll use cuBLAS.
          * Strangley, it seems that cuBLAS gemm is faster than syrk. */
         // Initialize cuBLAS
         cublasStatus_t stat;
@@ -300,7 +332,7 @@ void computeWeightedCov(size_t D, size_t N,
         if (stat != CUBLAS_STATUS_SUCCESS)
             mexErrMsgIdAndTxt(cudaErrId, "Unable to initialize cuBLAS context");
         // Allocate memory for the scaled copy
-        double *d_X;
+        numeric_t *d_X;
         cudaError_t cudaStat = cudaMalloc((void**)&d_X, D*N*sizeof(*d_A));
         if (cudaStat != cudaSuccess)
             mexErrMsgIdAndTxt(cudaErrId, "Failed to allocate CUDA memory");
@@ -311,9 +343,9 @@ void computeWeightedCov(size_t D, size_t N,
         sqrtScaledCopy<<<numBlocks,threadsPerBlock,sharedMemPerBlock>>>
                 (D, N, d_A, d_w, d_X);
         // C = X*X'
-        double const alpha = 1; // Scaling applied to X*X'
-        double const beta = 0;  // Scaling applied to C
-        stat = cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T,
+        numeric_t const alpha = 1; // Scaling applied to X*X'
+        numeric_t const beta = 0;  // Scaling applied to C
+        stat = gemm(handle, CUBLAS_OP_N, CUBLAS_OP_T,
                 D, D, N, &alpha, d_X, D, d_X, D, &beta, d_C, D);
         // Free the memory we'd allocated for the scaled copy
         cudaFree(d_X);
@@ -325,6 +357,15 @@ void computeWeightedCov(size_t D, size_t N,
 
 
 #ifdef MATLAB_MEX_FILE
+/* Some MATLAB helpers because these function names are ridiculous
+ */
+template <typename numeric_t>
+numeric_t const * gpuPtr(mxGPUArray const *mgpu_X)
+{   return static_cast<numeric_t const*>(mxGPUGetDataReadOnly(mgpu_X)); }
+template <typename numeric_t>
+numeric_t * gpuPtr(mxGPUArray *mgpu_X)
+{   return static_cast<numeric_t*>(mxGPUGetData(mgpu_X)); }
+
 /* Main entry point into this mex file
  * Inputs and outputs are arrays of mxArray pointers
  */
@@ -340,14 +381,14 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[])
         mexErrMsgIdAndTxt(errId, "A must be a gpuArray");
     mxGPUArray const *mgpu_A = mxGPUCreateFromMxArray( mx_A );
     mxGPUArrayCleanupWrapper cleanup_A(mgpu_A);
+    mxClassID numericType = mxGPUGetClassID(mgpu_A);
     if ((mxGPUGetNumberOfElements(mgpu_A)==0) || 
             (mxGPUGetNumberOfDimensions(mgpu_A)!=2) ||
-            (mxGPUGetClassID(mgpu_A)!=mxDOUBLE_CLASS))
-        mexErrMsgIdAndTxt(errId, "A must a 2-D double-precision gpuArray");
+            !((numericType==mxDOUBLE_CLASS) || (numericType==mxSINGLE_CLASS)) )
+        mexErrMsgIdAndTxt(errId, "A must be a 2-D real gpuArray");
     size_t const *dims = mxGPUGetDimensions( mgpu_A );
     size_t D = dims[0];
     size_t N = dims[1];
-    double const *d_A = (double const *) mxGPUGetDataReadOnly( mgpu_A );
     // weights = input 1
     mxArray const *mx_weights = prhs[1];
     if (!mxIsGPUArray(mx_weights))
@@ -356,36 +397,40 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[])
     mxGPUArrayCleanupWrapper cleanup_weights(mgpu_weights);
     if ((mxGPUGetNumberOfElements(mgpu_weights)==0) || 
             (mxGPUGetNumberOfDimensions(mgpu_weights)!=2) ||
-            (mxGPUGetClassID(mgpu_weights)!=mxDOUBLE_CLASS))
-        mexErrMsgIdAndTxt(errId, "weights must a 2-D double-precision gpuArray");
+            (mxGPUGetClassID(mgpu_weights)!=numericType))
+        mexErrMsgIdAndTxt(errId, "weights must be a 2-D gpuArray of the same type as A");
     dims = mxGPUGetDimensions( mgpu_weights );
     size_t N_weights = dims[0];
     size_t K = dims[1];
     if (N_weights != N)
         mexErrMsgIdAndTxt(errId, "weights must be a [N x K] gpuArray");
-    double const *d_weights = 
-            (double const *) mxGPUGetDataReadOnly( mgpu_weights );
     // k (weight index) = input 2
     mxArray const *mx_k = prhs[2];
     if (!mxIsScalar(mx_k))
         mexErrMsgIdAndTxt(errId, "k must be a scalar");
-    ptrdiff_t weight_index = ((ptrdiff_t) mxGetScalar(mx_k)) - 1;
+    ptrdiff_t weight_index = static_cast<ptrdiff_t>(mxGetScalar(mx_k)) - 1;
     if ((weight_index < 0) || (weight_index >= K))
         mexErrMsgIdAndTxt(errId, "k is out of bounds");
     
-    // Now we can get a pointer to the selected column of the weights
-    double const *d_w = d_weights + weight_index*N;
-    
     // Allocate memory for the output
-    size_t dims_C[2];
-    dims_C[0] = D; dims_C[1] = D;
-    mxGPUArray *mgpu_C = mxGPUCreateGPUArray(2, dims_C, 
-            mxDOUBLE_CLASS, mxREAL, MX_GPU_DO_NOT_INITIALIZE);
+    std::vector<size_t> dims_C = {D, D};
+    mxGPUArray *mgpu_C = mxGPUCreateGPUArray(2, dims_C.data(), 
+            numericType, mxREAL, MX_GPU_DO_NOT_INITIALIZE);
     mxGPUArrayCleanupWrapper cleanup_C(mgpu_C);
-    double *d_C = (double *) mxGPUGetData(mgpu_C);
     
     // Compute C = A*diag(w)*A'
-    computeWeightedCov(D, N, d_A, d_w, d_C);
+    switch (numericType) {
+        case mxDOUBLE_CLASS:
+            computeWeightedCov(D, N, gpuPtr<double>(mgpu_A), 
+                    gpuPtr<double>(mgpu_weights) + weight_index*N,
+                    gpuPtr<double>(mgpu_C) );
+            break;
+        case mxSINGLE_CLASS:
+            computeWeightedCov(D, N, gpuPtr<float>(mgpu_A), 
+                    gpuPtr<float>(mgpu_weights) + weight_index*N,
+                    gpuPtr<float>(mgpu_C) );
+            break;
+    }
     
     // Output 0 = C
     if (nlhs >= 1) {
@@ -399,25 +444,44 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[])
 
 #else
 
+template <typename numeric_t>
+void demo_weightCov(ptrdiff_t D, ptrdiff_t N)
+{
+    // Create the data
+    thrust::device_vector<numeric_t> A(D*N,1);
+    thrust::device_vector<numeric_t> w(N,1);
+    thrust::device_vector<numeric_t> C(D*D,0);
+    // Extract the raw pointers
+    numeric_t *d_A = thrust::raw_pointer_cast(A.data());
+    numeric_t *d_w = thrust::raw_pointer_cast(w.data());
+    numeric_t *d_C = thrust::raw_pointer_cast(C.data());
+    
+    // Compute C = A*diag(w)*A'
+    computeWeightedCov(D, N, d_A, d_w, d_C);
+}    
+
 /* Main entry point if this is compiled externally (i.e. not as a MEX file)
  * This sets up and runs a simple example program and is suitable for benchmarking
  */
 int main(int argc, char* argv[])
 {
     // Define the sizes
-    size_t D = (argc > 1) ? (size_t) std::atoi(argv[1]) : 12;
-    size_t N = (argc > 2) ? (size_t) std::atoi(argv[2]) : 500000;
-    // Create the data
-    thrust::device_vector<double> A(D*N,1);
-    thrust::device_vector<double> w(N,1);
-    thrust::device_vector<double> C(D*D,0);
-    // Extract the raw pointers
-    double *d_A = thrust::raw_pointer_cast(A.data());
-    double *d_w = thrust::raw_pointer_cast(w.data());
-    double *d_C = thrust::raw_pointer_cast(C.data());
-    
-    // Compute C = A*diag(w)*A'
-    computeWeightedCov(D, N, d_A, d_w, d_C);
+    ptrdiff_t D=12, N=500000;
+    bool use_single = false;
+    int c;
+    while ( (c = getopt(argc,argv,"D:N:s")) != -1 ) {
+        switch (c) {
+            case 'D': D = std::atoi(optarg); break; 
+            case 'N': N = std::atoi(optarg); break; 
+            case 's': use_single = true;    break;
+        }
+    }
+    // Call the appropriate demo type
+    if (use_single) {
+        demo_weightCov<float>(D, N);
+    } else {
+        demo_weightCov<double>(D, N);
+    }
 }
 
 #endif
