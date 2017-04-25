@@ -35,6 +35,7 @@
 #include <iostream>
 #include <cstdlib>
 #include <algorithm>
+#include <cmath>
 
 
 /* CUDA kernel for computing A*diag(w)*A'
@@ -179,17 +180,20 @@ __global__ void sumColumns( int const nRows, int const nCols,
  * This assumes 1-D thread blocks, shared memory of the same size, and a 
  * 1-D block grid. Each [P x 1] thread block will process a [D x P] block of
  * data at a time, and take grid-sized strides across the data.
+ * 
+ * B can have more columns than A, in which case they will be filled with zero.
  *
  * Inputs:
  *    D     Number of rows in A, B
- *    N     Number of columns in A, B
+ *    N_A   Number of columns in A
+ *    N_B   Number of columns in B
  *    A     [D x N] data matrix
  *    w     [N] weight vector
  * Outputs:
  *    B     [D x N] scaled data matrix
  */
 template <typename numeric_t>
-__global__ void sqrtScaledCopy(int D, int N, 
+__global__ void sqrtScaledCopy(int D, int N_A, int N_B,
         numeric_t const *A, numeric_t const *w, numeric_t *B)
 {
     // Dynamically-allocated shared memory
@@ -198,25 +202,37 @@ __global__ void sqrtScaledCopy(int D, int N,
     // Notational convenience for some dimensions
     int tIdx = threadIdx.x;
     int P = blockDim.x;
-    
-    // For loop over the [N] dimension
+    // Realign everything with the block offset
     int blockStart = blockIdx.x * P;
+    A += D*blockStart;
+    w += blockStart;
+    B += D*blockStart;
+    N_A -= blockStart; // # of columns in A remaining
+    N_B -= blockStart; // # of columns in B remaining
+    // Loop over the [N] dimension
     int blockStride = P * gridDim.x;
-    for (int bColOffset=blockStart; bColOffset<N; bColOffset+=blockStride) {
+    while (N_B > 0) {
         // Read and sqrt() the weight vector
-        int wIdx = tIdx + bColOffset;
-        if (wIdx < N)
-            S[tIdx] = sqrt(w[wIdx]);
+        if (tIdx < N_A)
+            S[tIdx] = sqrt(w[tIdx]);
         __syncthreads();
         // Read, scale, and write the data in these columns
-        int bDataOffset = bColOffset * D;
-        int dataCount = min(P,N-bColOffset) * D;
+        int dataCount = D * min(P,N_B);
         int dataStride = blockDim.x;
         for (int dataIdx=tIdx; dataIdx<dataCount; dataIdx+=dataStride) {
             int dataCol = dataIdx/D;
-            B[dataIdx+bDataOffset] = S[dataCol] * A[dataIdx+bDataOffset];
+            if (dataCol < N_A)
+                B[dataIdx] = S[dataCol] * A[dataIdx];
+            else
+                B[dataIdx] = 0;
         }
         __syncthreads();
+        // Increment the pointers and counters
+        A += D*blockStride;
+        w += blockStride;
+        B += D*blockStride;
+        N_A -= blockStride;
+        N_B -= blockStride;
     }
 }
 
@@ -235,6 +251,34 @@ cublasStatus_t gemm(
         const float *A, ptrdiff_t lda, const float *B, ptrdiff_t ldb, 
         const float *beta, float *C, ptrdiff_t ldc )
 {   return cublasSgemm(handle,ta,tb,m,n,k,alpha,A,lda,B,ldb,beta,C,ldc); }
+cublasStatus_t gemmStridedBatched( 
+        cublasHandle_t handle, cublasOperation_t ta, cublasOperation_t tb,
+        ptrdiff_t m, ptrdiff_t n, ptrdiff_t k, const double *alpha, 
+        const double *A, ptrdiff_t lda, ptrdiff_t strideA, 
+        const double *B, ptrdiff_t ldb, ptrdiff_t strideB, const double *beta,
+        double *C, ptrdiff_t ldc, ptrdiff_t strideC, ptrdiff_t batchCount )
+{   return cublasDgemmStridedBatched(handle,ta,tb,m,n,k,alpha,
+            A,lda,strideA,B,ldb,strideB,beta,C,ldc,strideC,batchCount); }
+cublasStatus_t gemmStridedBatched(
+        cublasHandle_t handle, cublasOperation_t ta, cublasOperation_t tb,
+        ptrdiff_t m, ptrdiff_t n, ptrdiff_t k, const float *alpha, 
+        const float *A, ptrdiff_t lda, ptrdiff_t strideA, 
+        const float *B, ptrdiff_t ldb, ptrdiff_t strideB, const float *beta, 
+        float *C, ptrdiff_t ldc, ptrdiff_t strideC, ptrdiff_t batchCount )
+{   return cublasSgemmStridedBatched(handle,ta,tb,m,n,k,alpha,
+            A,lda,strideA,B,ldb,strideB,beta,C,ldc,strideC,batchCount); }
+cublasStatus_t gemv(
+        cublasHandle_t handle, cublasOperation_t trans, ptrdiff_t m, ptrdiff_t n,
+        const double *alpha, const double *A, ptrdiff_t lda, 
+        const double *x, ptrdiff_t incx,
+        const double *beta, double *y, ptrdiff_t incy)
+{   return cublasDgemv(handle,trans,m,n,alpha,A,lda,x,incx,beta,y,incy); }
+cublasStatus_t gemv(
+        cublasHandle_t handle, cublasOperation_t trans, ptrdiff_t m, ptrdiff_t n,
+        const float *alpha, const float *A, ptrdiff_t lda, 
+        const float *x, ptrdiff_t incx,
+        const float *beta, float *y, ptrdiff_t incy)
+{   return cublasSgemv(handle,trans,m,n,alpha,A,lda,x,incx,beta,y,incy); }
 
 
 /* Simple wrapper classes so we can do RAII-style cleanup 
@@ -262,6 +306,42 @@ void mexErrMsgIdAndTxt(char const *errId, char const *errMsg)
 #endif
 
 
+int nextPow2(double x) { return static_cast<int>( exp2(ceil(log2( x ))) ); }
+template <typename T>
+int nextPow2(T x) { return nextPow2(static_cast<double>(x)); }
+
+/* Optimize the number of batches to use
+ * 
+ * Inputs:
+ *    D         Number of feature space dimensions
+ *    N         Number of spikes
+ * Outputs:
+ *    nBatches  Number of batches to perform this in
+ *    batchSize Size of each batch (#spikes)
+ */
+void optimizeBatches_blas(int D, int N, int &nBatches, int &batchSize)
+{
+    // batchSize = nBatches = sqrt(N) is best for numerical accuracy.
+    // Round this to the next power of 2
+    batchSize = nextPow2( sqrt(N) );
+    // Enforce some minimum sizes
+    batchSize = std::max(batchSize, 256); // Computational efficiency
+    batchSize = std::max(batchSize, nextPow2(10*D)); // Memory overhead
+    // Determine the number of batches
+    nBatches = (N + batchSize-1) / batchSize;
+    // Some special cases
+    if (nBatches < 4) {
+        // If it's a small number of batches, just forget it
+        nBatches = 1;
+        batchSize = N;
+    } else if (nBatches*batchSize > 1.125*N) {
+        // Use smaller batches if there would be a lot of inflation
+        batchSize /= 2;
+        nBatches = (N + batchSize-1) / batchSize;
+    }
+}
+
+
 /* Main routine for computing the weighted covariance
  *
  * Inputs:
@@ -277,16 +357,18 @@ void computeWeightedCov(size_t D, size_t N,
         numeric_t const * d_A, numeric_t const * d_w, numeric_t * d_C)
 {
     char const * const cudaErrId = "MoDT:weightCovGpu:cudaError";
+    // Get some device info
+    int deviceNo;
+    cudaGetDevice(&deviceNo);
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, deviceNo);
+    // Call our kernel or cuBLAS
     if ((D < 32) && std::is_same<double,numeric_t>::value) {
         /* When D is small, we can improve GPU utilization by breaking X into
          * batches, computing the weighted covariance of each batch, and then
          * summing across the batches. */
         
         // Figure out how to maximize the kernel residency
-        int deviceNo;
-        cudaGetDevice(&deviceNo);
-        cudaDeviceProp prop;
-        cudaGetDeviceProperties(&prop, deviceNo);
         int numMPs = prop.multiProcessorCount;
         /* I haven't found a way to programatically determine the maximum number
          * of blocks per multiprocessor or the total shared memory per MP, so 
@@ -331,27 +413,63 @@ void computeWeightedCov(size_t D, size_t N,
         cublasHandleCleanupWrapper cleanup_handle(handle);
         if (stat != CUBLAS_STATUS_SUCCESS)
             mexErrMsgIdAndTxt(cudaErrId, "Unable to initialize cuBLAS context");
+        // Decide on the number of batches
+        int nBatches, batchSize;
+        optimizeBatches_blas(D, N, nBatches, batchSize);
+        ptrdiff_t N_padded = nBatches * batchSize;
         // Allocate memory for the scaled copy
         numeric_t *d_X;
-        cudaError_t cudaStat = cudaMalloc((void**)&d_X, D*N*sizeof(*d_A));
+        cudaError_t cudaStat = cudaMalloc((void**)&d_X, D*N_padded*sizeof(*d_A));
         if (cudaStat != cudaSuccess)
             mexErrMsgIdAndTxt(cudaErrId, "Failed to allocate CUDA memory");
         // X = bsxfun(@times, A, sqrt(w)')
-        int threadsPerBlock = 256;
-        int numBlocks = min(128, (int) ((N+threadsPerBlock-1)/threadsPerBlock));
-        int sharedMemPerBlock = threadsPerBlock*sizeof(*d_A);
-        sqrtScaledCopy<<<numBlocks,threadsPerBlock,sharedMemPerBlock>>>
-                (D, N, d_A, d_w, d_X);
+        int tPerBlk = 256;
+        int numBlocks = prop.multiProcessorCount
+                        * (prop.maxThreadsPerMultiProcessor / tPerBlk);
+        numBlocks = std::min(numBlocks, 
+                             static_cast<int>((N_padded+tPerBlk-1)/tPerBlk) );
+        int sharedMemPerBlock = tPerBlk * sizeof(*d_A);
+        sqrtScaledCopy<<<numBlocks,tPerBlk,sharedMemPerBlock>>>
+                (D, N, N_padded, d_A, d_w, d_X);
         // C = X*X'
         numeric_t const alpha = 1; // Scaling applied to X*X'
-        numeric_t const beta = 0;  // Scaling applied to C
-        stat = gemm(handle, CUBLAS_OP_N, CUBLAS_OP_T,
-                D, D, N, &alpha, d_X, D, d_X, D, &beta, d_C, D);
-        // Free the memory we'd allocated for the scaled copy
+        numeric_t const beta = 0;  // Scaling applied to C    
+        if (nBatches > 1) {
+            // Allocate memory for batches
+            numeric_t *d_CBatched;
+            cudaError_t cudaStat = cudaMalloc((void**)&d_CBatched, 
+                D*D*nBatches*sizeof(*d_CBatched));
+            // Perform the batched operation
+            stat = gemmStridedBatched(handle, CUBLAS_OP_N, CUBLAS_OP_T, D, D, batchSize,
+                    &alpha, d_X, D, D*batchSize, d_X, D, D*batchSize,
+                    &beta, d_CBatched, D, D*D, nBatches);
+            if (stat != CUBLAS_STATUS_SUCCESS)
+                mexErrMsgIdAndTxt(cudaErrId, "cuBLAS error during GEMM");
+            // Create a vector of all ones
+            std::vector<numeric_t> ones(nBatches, 1.0);
+            numeric_t *d_ones;
+            cudaStat = cudaMalloc((void**)&d_ones, nBatches*sizeof(*d_ones));
+            if (cudaStat != cudaSuccess)
+                mexErrMsgIdAndTxt(cudaErrId, "Failed to allocate CUDA memory");
+            stat = cublasSetMatrix(nBatches, 1, sizeof(*d_ones), 
+                    ones.data(), nBatches, d_ones, nBatches);
+            if (stat != CUBLAS_STATUS_SUCCESS)
+                mexErrMsgIdAndTxt(cudaErrId, "cuBLAS error copying to GPU");
+            // Sum across batches
+            stat = gemv(handle, CUBLAS_OP_N, D*D, nBatches, 
+                    &alpha, d_CBatched,D*D, d_ones,1, &beta, d_C,1 );
+            if (stat != CUBLAS_STATUS_SUCCESS)
+                mexErrMsgIdAndTxt(cudaErrId, "cuBLAS error calling GEMV");
+            cudaFree(d_CBatched);
+            cudaFree(d_ones);
+        } else {
+            // No batches
+            stat = gemm(handle, CUBLAS_OP_N, CUBLAS_OP_T,
+                    D, D, N, &alpha, d_X, D, d_X, D, &beta, d_C, D);
+            if (stat != CUBLAS_STATUS_SUCCESS)
+                mexErrMsgIdAndTxt(cudaErrId, "cuBLAS error during GEMM");
+        }
         cudaFree(d_X);
-        // Check for a linear algebra error
-        if (stat != CUBLAS_STATUS_SUCCESS)
-            mexErrMsgIdAndTxt(cudaErrId, "cuBLAS error during GEMM");
     }
 }
 
