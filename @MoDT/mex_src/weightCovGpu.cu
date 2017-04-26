@@ -18,7 +18,9 @@
  * When D >= 32, this custom kernel doesn't work (needs > 1024 threads/block),
  * so we produce a scaled copy of A (scaled by sqrt(w)) and then call dgemm.
  *
- * Kevin Shan, 2016-06-14
+ * Kevin Shan
+ * 2017-04-25  Add single-precision support
+ * 2016-06-14  Initial version
  *============================================================================*/
 
 #ifdef MATLAB_MEX_FILE
@@ -54,15 +56,17 @@
  * Outputs:
  *    C             [D x D x #blocks] matrix to store the output
  */
-int const READ_BUFF_SZ = 32;
+int const READ_BUFF_BYTES = 256;
+template <typename numeric_t>
 __global__ void calcWeightedCov(
-        int const D, int const N, double const *A, double const *w, double *C)
+        int D, int N, numeric_t const *A, numeric_t const *w, numeric_t *C)
 {
     // Dynamically-allocated shared memory, length = (D+1)*32
     extern __shared__ __align__(sizeof(int4)) unsigned char shared_mem[];
-    double *S = reinterpret_cast<double*>(shared_mem);
-    double *w_buff = S;                // [32 x 1] buffer for weights
-    double *A_buff = S + READ_BUFF_SZ; // [D x 32] buffer for data matrix
+    numeric_t *S = reinterpret_cast<numeric_t*>(shared_mem);
+    int const READ_BUFF_SZ = READ_BUFF_BYTES/sizeof(numeric_t);
+    numeric_t *w_buff = S;                // [32 x 1] buffer for weights
+    numeric_t *A_buff = S + READ_BUFF_SZ; // [D x 32] buffer for data matrix
     
     // Figure out what this thread is supposed to be doing
     int const tIdx = threadIdx.x;
@@ -70,7 +74,7 @@ __global__ void calcWeightedCov(
     // Loading phase: the first 32 threads will load w, rest will do A
     int const readOps_w = READ_BUFF_SZ; // Gonna assume nThreads > READ_BUFF_SZ
     int const tIdx_A = (tIdx - readOps_w + nThreads) % nThreads;
-    int const readOps_A = D * READ_BUFF_SZ * sizeof(double)/sizeof(double2);
+    int const readOps_A = D * READ_BUFF_SZ * sizeof(numeric_t)/sizeof(int4);
     // Compute phase: this thread will compute C(ii,jj)
     int ii = -1, jj = -1;
     if (tIdx < D*(D+1)/2) {
@@ -80,25 +84,32 @@ __global__ void calcWeightedCov(
         }
     }
     // And we will store the result in this local register
-    double result_acc = 0;
+    numeric_t result_acc = 0;
     
+    // Realign the inputs with the block offset
+    int blockStart = READ_BUFF_SZ * blockIdx.x;
+    A += D*blockStart;
+    w += blockStart;
+    N -= blockStart;
+    C += D*D*blockIdx.x;
     // Main loop: grid-stride loop over complete buffers
-    int readOffset = READ_BUFF_SZ * blockIdx.x;
-    for ( ; readOffset <= N-READ_BUFF_SZ; readOffset += READ_BUFF_SZ*gridDim.x) {
+    int blockStride = READ_BUFF_SZ * gridDim.x;
+    while (N >= READ_BUFF_SZ) {
         // Load w from memory
         if (tIdx < readOps_w)
-            w_buff[tIdx] = w[readOffset + tIdx];
+            w_buff[tIdx] = w[tIdx];
         // Load A from memory, 16 bytes at a time
-        double2 const *src = reinterpret_cast<double2 const*>(A + D*readOffset);
-        double2 *tgt = reinterpret_cast<double2*>(A_buff);
+        int4 const *src = reinterpret_cast<int4 const*>(A);
+        int4 *tgt = reinterpret_cast<int4*>(A_buff);
         for (int idx = tIdx_A; idx < readOps_A; idx += nThreads)
             tgt[idx] = src[idx];
         // Wait for load to complete
         __syncthreads();
+        
         // Compute
         if (ii >= 0) {
             // Compute the result for this buffer
-            double local_acc = 0;
+            numeric_t local_acc = 0;
             for (int kk=0; kk<READ_BUFF_SZ; kk++)
                 local_acc += A_buff[ii+D*kk] * A_buff[jj+D*kk] * w_buff[kk];
             // Add it to the running total
@@ -106,22 +117,24 @@ __global__ void calcWeightedCov(
         }
         // Wait for computation to finish
         __syncthreads();
+        
+        // Increment the pointers and counters
+        A += D*blockStride;
+        w += blockStride;
+        N -= blockStride;
     }
     // Deal with remaining data
-    int nLeftover = N - readOffset;
-    if (nLeftover > 0) {
-        // Load remaining w
-        if (tIdx < nLeftover)
-            w_buff[tIdx] = w[readOffset + tIdx];
-        // Load remaining A
-        for (int idx = tIdx_A; idx < D*nLeftover; idx += nThreads)
-            A_buff[idx] = A[D*readOffset + idx];
-        // Wait for load to complete.
+    if (N > 0) {
+        // Load remaining w and A
+        if (tIdx < N)
+            w_buff[tIdx] = w[tIdx];
+        for (int idx = tIdx_A; idx < D*N; idx += nThreads)
+            A_buff[idx] = A[idx];
         __syncthreads();
         // Compute
         if (ii >= 0) {
-            double local_acc = 0;
-            for (int kk=0; kk<nLeftover; kk++)
+            numeric_t local_acc = 0;
+            for (int kk=0; kk<N; kk++)
                 local_acc += A_buff[ii+D*kk] * A_buff[jj+D*kk] * w_buff[kk];
             result_acc += local_acc;
         }
@@ -129,20 +142,11 @@ __global__ void calcWeightedCov(
     
     // Write output to global memory
     if (ii >= 0) {
-        double *C_block = C + D*D*blockIdx.x;
-        C_block[ii+D*jj] = result_acc;
+        C[ii+D*jj] = result_acc;
         // Write the other half as well
         if (ii != jj)
-            C_block[jj+D*ii] = result_acc;
+            C[jj+D*ii] = result_acc;
     }
-}
-
-/* Dummy version for single-precision. Needed for compilation but we should 
- * never call it during runtime.
- */
-__global__ void calcWeightedCov(
-        int const D, int const N, float const *A, float const *w, float *C)
-{
 }
 
 
@@ -241,43 +245,43 @@ __global__ void sqrtScaledCopy(int D, int N_A, int N_B,
  */
 cublasStatus_t gemm( 
         cublasHandle_t handle, cublasOperation_t ta, cublasOperation_t tb,
-        ptrdiff_t m, ptrdiff_t n, ptrdiff_t k, const double *alpha, 
-        const double *A, ptrdiff_t lda, const double *B, ptrdiff_t ldb, 
-        const double *beta, double *C, ptrdiff_t ldc )
+        int m, int n, int k, const double *alpha, 
+        const double *A, int lda, const double *B, int ldb, 
+        const double *beta, double *C, int ldc )
 {   return cublasDgemm(handle,ta,tb,m,n,k,alpha,A,lda,B,ldb,beta,C,ldc); }
 cublasStatus_t gemm( 
         cublasHandle_t handle, cublasOperation_t ta, cublasOperation_t tb,
-        ptrdiff_t m, ptrdiff_t n, ptrdiff_t k, const float *alpha, 
-        const float *A, ptrdiff_t lda, const float *B, ptrdiff_t ldb, 
-        const float *beta, float *C, ptrdiff_t ldc )
+        int m, int n, int k, const float *alpha, 
+        const float *A, int lda, const float *B, int ldb, 
+        const float *beta, float *C, int ldc )
 {   return cublasSgemm(handle,ta,tb,m,n,k,alpha,A,lda,B,ldb,beta,C,ldc); }
 cublasStatus_t gemmStridedBatched( 
         cublasHandle_t handle, cublasOperation_t ta, cublasOperation_t tb,
-        ptrdiff_t m, ptrdiff_t n, ptrdiff_t k, const double *alpha, 
-        const double *A, ptrdiff_t lda, ptrdiff_t strideA, 
-        const double *B, ptrdiff_t ldb, ptrdiff_t strideB, const double *beta,
-        double *C, ptrdiff_t ldc, ptrdiff_t strideC, ptrdiff_t batchCount )
+        int m, int n, int k, const double *alpha, 
+        const double *A, int lda, ptrdiff_t strideA, 
+        const double *B, int ldb, ptrdiff_t strideB, const double *beta,
+        double *C, int ldc, ptrdiff_t strideC, int batchCount )
 {   return cublasDgemmStridedBatched(handle,ta,tb,m,n,k,alpha,
             A,lda,strideA,B,ldb,strideB,beta,C,ldc,strideC,batchCount); }
 cublasStatus_t gemmStridedBatched(
         cublasHandle_t handle, cublasOperation_t ta, cublasOperation_t tb,
-        ptrdiff_t m, ptrdiff_t n, ptrdiff_t k, const float *alpha, 
-        const float *A, ptrdiff_t lda, ptrdiff_t strideA, 
-        const float *B, ptrdiff_t ldb, ptrdiff_t strideB, const float *beta, 
-        float *C, ptrdiff_t ldc, ptrdiff_t strideC, ptrdiff_t batchCount )
+        int m, int n, int k, const float *alpha, 
+        const float *A, int lda, ptrdiff_t strideA, 
+        const float *B, int ldb, ptrdiff_t strideB, const float *beta, 
+        float *C, int ldc, ptrdiff_t strideC, int batchCount )
 {   return cublasSgemmStridedBatched(handle,ta,tb,m,n,k,alpha,
             A,lda,strideA,B,ldb,strideB,beta,C,ldc,strideC,batchCount); }
 cublasStatus_t gemv(
-        cublasHandle_t handle, cublasOperation_t trans, ptrdiff_t m, ptrdiff_t n,
-        const double *alpha, const double *A, ptrdiff_t lda, 
-        const double *x, ptrdiff_t incx,
-        const double *beta, double *y, ptrdiff_t incy)
+        cublasHandle_t handle, cublasOperation_t trans, int m, int n,
+        const double *alpha, const double *A, int lda, 
+        const double *x, int incx,
+        const double *beta, double *y, int incy)
 {   return cublasDgemv(handle,trans,m,n,alpha,A,lda,x,incx,beta,y,incy); }
 cublasStatus_t gemv(
-        cublasHandle_t handle, cublasOperation_t trans, ptrdiff_t m, ptrdiff_t n,
-        const float *alpha, const float *A, ptrdiff_t lda, 
-        const float *x, ptrdiff_t incx,
-        const float *beta, float *y, ptrdiff_t incy)
+        cublasHandle_t handle, cublasOperation_t trans, int m, int n,
+        const float *alpha, const float *A, int lda, 
+        const float *x, int incx,
+        const float *beta, float *y, int incy)
 {   return cublasSgemv(handle,trans,m,n,alpha,A,lda,x,incx,beta,y,incy); }
 
 
@@ -294,6 +298,9 @@ struct cublasHandleCleanupWrapper {
     cublasHandle_t handle;
     cublasHandleCleanupWrapper(cublasHandle_t h) {handle = h;}
     ~cublasHandleCleanupWrapper(void) {cublasDestroy(handle);}
+};
+struct CudaDeleter {
+    void operator() (void *d_ptr) { cudaFree(d_ptr); }
 };
 
 /* Define a "mexErrMsgIdAndTxt" function for the non-MATLAB case
@@ -315,17 +322,19 @@ int nextPow2(T x) { return nextPow2(static_cast<double>(x)); }
  * Inputs:
  *    D         Number of feature space dimensions
  *    N         Number of spikes
+ *    M         Adjustment factor (M=1 for GEMM)
  * Outputs:
  *    nBatches  Number of batches to perform this in
  *    batchSize Size of each batch (#spikes)
  */
-void optimizeBatches_blas(int D, int N, int &nBatches, int &batchSize)
+void optimizeBatches(int D, int N, int M, int &nBatches, int &batchSize)
 {
     // batchSize = nBatches = sqrt(N) is best for numerical accuracy.
     // Round this to the next power of 2
-    batchSize = nextPow2( sqrt(N) );
+    batchSize = nextPow2( M*sqrt((N+M-1)/M) );
     // Enforce some minimum sizes
     batchSize = std::max(batchSize, 256); // Computational efficiency
+    batchSize = std::max(batchSize, M*32); // Roundoff error with adjustment
     batchSize = std::max(batchSize, nextPow2(10*D)); // Memory overhead
     // Determine the number of batches
     nBatches = (N + batchSize-1) / batchSize;
@@ -353,59 +362,38 @@ void optimizeBatches_blas(int D, int N, int &nBatches, int &batchSize)
  *    d_C       [D x D] covariance matrix
  */
 template <typename numeric_t>
-void computeWeightedCov(size_t D, size_t N, 
+void computeWeightedCov(int D, int N, 
         numeric_t const * d_A, numeric_t const * d_w, numeric_t * d_C)
 {
     char const * const cudaErrId = "MoDT:weightCovGpu:cudaError";
+    cudaError_t cudaStat;
     // Get some device info
     int deviceNo;
     cudaGetDevice(&deviceNo);
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, deviceNo);
-    // Call our kernel or cuBLAS
-    if ((D < 32) && std::is_same<double,numeric_t>::value) {
-        /* When D is small, we can improve GPU utilization by breaking X into
-         * batches, computing the weighted covariance of each batch, and then
-         * summing across the batches. */
-        
-        // Figure out how to maximize the kernel residency
-        int numMPs = prop.multiProcessorCount;
-        /* I haven't found a way to programatically determine the maximum number
-         * of blocks per multiprocessor or the total shared memory per MP, so 
-         * this is going to be hardcoded for Compute Capability 3.0 */
-        int maxWarpsPerMP = 64;
-        int maxSharedMemPerMP = 48*1024;
-        int maxBlocksPerMP = 16;
-        // Determine the maximum number of blocks per multiprocessor (MP)
-        int minWarpsPerBlock = (D*(D+1)/2 + 31)/32;
-        int sharedMemPerBlock = (D+1)*32*sizeof(*d_A);
-        int blocksPerMP = std::min( maxWarpsPerMP/minWarpsPerBlock, 
-                maxSharedMemPerMP/sharedMemPerBlock );
-        blocksPerMP = std::min(blocksPerMP, maxBlocksPerMP);
-        // Allocate additional warps if the limit allows. Although these won't
-        // participate in computation, they can help load data.
-        int warpsPerBlock = std::max(minWarpsPerBlock, maxWarpsPerMP/blocksPerMP);
-        // And decide on how many blocks total
-        int numBlocks = std::min( (int)(N/1024)+1, blocksPerMP*numMPs );
-        
-        // Allocate memory for the outputs
-        numeric_t *d_CBatched;
-        cudaError_t cudaStat = cudaMalloc((void**)&d_CBatched, 
-                D*D*numBlocks*sizeof(*d_CBatched));
+    // Decide on the batching and whether to use cuBLAS or our own kernel
+    bool use_blas = (D > 44);
+    int nBatches, batchSize;
+    if (use_blas)
+        optimizeBatches(D, N, 1, nBatches, batchSize);
+    else
+        optimizeBatches(D, N, READ_BUFF_BYTES/sizeof(d_A), nBatches, batchSize);
+    // Allocate memory for batches, if necessary
+    numeric_t *d_CBatched;
+    std::unique_ptr<numeric_t,CudaDeleter> cleanup_CBatched;
+    if (nBatches > 1) {
+        cudaStat = cudaMalloc((void**)&d_CBatched, 
+                static_cast<ptrdiff_t>(D)*D*nBatches*sizeof(d_A) );
         if (cudaStat != cudaSuccess)
-            mexErrMsgIdAndTxt(cudaErrId, "Failed to allocate CUDA memory");
-        // Launch our CUDA kernel to calculate the weighted covariance
-        int threadsPerBlock = 32*warpsPerBlock;
-        calcWeightedCov<<<numBlocks,threadsPerBlock,sharedMemPerBlock>>>
-                (D, N, d_A, d_w, d_CBatched);
-        // Sum the batched results
-        sumColumns<<<(D*D+31)/32, 32>>>(D*D, numBlocks, d_CBatched, d_C);
-        // Free the memory that we'd allocated for the outputs
-        cudaFree(d_CBatched);
+            mexErrMsgIdAndTxt(cudaErrId, "Failed to allocate CUDA memory for batch output");
+        cleanup_CBatched = std::unique_ptr<numeric_t,CudaDeleter>{d_CBatched};
+    } else {
+        // No batch necessary
+        d_CBatched = d_C;
     }
-    else {
-        /* For larger D (or single precision), we'll use cuBLAS.
-         * Strangley, it seems that cuBLAS gemm is faster than syrk. */
+    // Compute the covariance
+    if (use_blas) {
         // Initialize cuBLAS
         cublasStatus_t stat;
         cublasHandle_t handle;
@@ -413,21 +401,17 @@ void computeWeightedCov(size_t D, size_t N,
         cublasHandleCleanupWrapper cleanup_handle(handle);
         if (stat != CUBLAS_STATUS_SUCCESS)
             mexErrMsgIdAndTxt(cudaErrId, "Unable to initialize cuBLAS context");
-        // Decide on the number of batches
-        int nBatches, batchSize;
-        optimizeBatches_blas(D, N, nBatches, batchSize);
-        ptrdiff_t N_padded = nBatches * batchSize;
         // Allocate memory for the scaled copy
         numeric_t *d_X;
-        cudaError_t cudaStat = cudaMalloc((void**)&d_X, D*N_padded*sizeof(*d_A));
+        int N_padded = nBatches * batchSize;
+        cudaError_t cudaStat = cudaMalloc((void**)&d_X, 
+                static_cast<ptrdiff_t>(D)*N_padded*sizeof(*d_A) );
         if (cudaStat != cudaSuccess)
-            mexErrMsgIdAndTxt(cudaErrId, "Failed to allocate CUDA memory");
-        // X = bsxfun(@times, A, sqrt(w)')
+            mexErrMsgIdAndTxt(cudaErrId, "Failed to allocate CUDA memory for scaled copy");
+        std::unique_ptr<numeric_t,CudaDeleter> cleanup_X(d_X);
+        // Perform the scaled copy
         int tPerBlk = 256;
-        int numBlocks = prop.multiProcessorCount
-                        * (prop.maxThreadsPerMultiProcessor / tPerBlk);
-        numBlocks = std::min(numBlocks, 
-                             static_cast<int>((N_padded+tPerBlk-1)/tPerBlk) );
+        int numBlocks = std::min(128, (N_padded+tPerBlk-1)/tPerBlk);
         int sharedMemPerBlock = tPerBlk * sizeof(*d_A);
         sqrtScaledCopy<<<numBlocks,tPerBlk,sharedMemPerBlock>>>
                 (D, N, N_padded, d_A, d_w, d_X);
@@ -435,41 +419,30 @@ void computeWeightedCov(size_t D, size_t N,
         numeric_t const alpha = 1; // Scaling applied to X*X'
         numeric_t const beta = 0;  // Scaling applied to C    
         if (nBatches > 1) {
-            // Allocate memory for batches
-            numeric_t *d_CBatched;
-            cudaError_t cudaStat = cudaMalloc((void**)&d_CBatched, 
-                D*D*nBatches*sizeof(*d_CBatched));
-            // Perform the batched operation
-            stat = gemmStridedBatched(handle, CUBLAS_OP_N, CUBLAS_OP_T, D, D, batchSize,
+            stat = gemmStridedBatched(handle, CUBLAS_OP_N, CUBLAS_OP_T, 
+                    D, D, batchSize,
                     &alpha, d_X, D, D*batchSize, d_X, D, D*batchSize,
                     &beta, d_CBatched, D, D*D, nBatches);
-            if (stat != CUBLAS_STATUS_SUCCESS)
-                mexErrMsgIdAndTxt(cudaErrId, "cuBLAS error during GEMM");
-            // Create a vector of all ones
-            std::vector<numeric_t> ones(nBatches, 1.0);
-            numeric_t *d_ones;
-            cudaStat = cudaMalloc((void**)&d_ones, nBatches*sizeof(*d_ones));
-            if (cudaStat != cudaSuccess)
-                mexErrMsgIdAndTxt(cudaErrId, "Failed to allocate CUDA memory");
-            stat = cublasSetMatrix(nBatches, 1, sizeof(*d_ones), 
-                    ones.data(), nBatches, d_ones, nBatches);
-            if (stat != CUBLAS_STATUS_SUCCESS)
-                mexErrMsgIdAndTxt(cudaErrId, "cuBLAS error copying to GPU");
-            // Sum across batches
-            stat = gemv(handle, CUBLAS_OP_N, D*D, nBatches, 
-                    &alpha, d_CBatched,D*D, d_ones,1, &beta, d_C,1 );
-            if (stat != CUBLAS_STATUS_SUCCESS)
-                mexErrMsgIdAndTxt(cudaErrId, "cuBLAS error calling GEMV");
-            cudaFree(d_CBatched);
-            cudaFree(d_ones);
         } else {
-            // No batches
             stat = gemm(handle, CUBLAS_OP_N, CUBLAS_OP_T,
                     D, D, N, &alpha, d_X, D, d_X, D, &beta, d_C, D);
-            if (stat != CUBLAS_STATUS_SUCCESS)
-                mexErrMsgIdAndTxt(cudaErrId, "cuBLAS error during GEMM");
         }
-        cudaFree(d_X);
+        if (stat != CUBLAS_STATUS_SUCCESS)
+            mexErrMsgIdAndTxt(cudaErrId, "cuBLAS error during GEMM");
+    } else {
+        // Launch our CUDA kernel
+        int warpsPerBlock = std::max(2, ((D*(D+1))/2 + 31)/32);
+        int tPerBlk = 32 * warpsPerBlock;
+        int sharedMemPerBlock = (D+1)*READ_BUFF_BYTES;
+        int numBlocks = nBatches;
+        calcWeightedCov<<<numBlocks,tPerBlk,sharedMemPerBlock>>>
+                (D, N, d_A, d_w, d_CBatched);
+    }
+    // Sum across batches
+    if (nBatches > 1) {
+        int tPerBlk = 256;
+        int numBlocks = (D*D + tPerBlk-1) / tPerBlk;
+        sumColumns<<<numBlocks,tPerBlk>>>(D*D, nBatches, d_CBatched, d_C);
     }
 }
 
@@ -505,8 +478,8 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[])
             !((numericType==mxDOUBLE_CLASS) || (numericType==mxSINGLE_CLASS)) )
         mexErrMsgIdAndTxt(errId, "A must be a 2-D real gpuArray");
     size_t const *dims = mxGPUGetDimensions( mgpu_A );
-    size_t D = dims[0];
-    size_t N = dims[1];
+    int D = dims[0];
+    int N = dims[1];
     // weights = input 1
     mxArray const *mx_weights = prhs[1];
     if (!mxIsGPUArray(mx_weights))
@@ -518,8 +491,8 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[])
             (mxGPUGetClassID(mgpu_weights)!=numericType))
         mexErrMsgIdAndTxt(errId, "weights must be a 2-D gpuArray of the same type as A");
     dims = mxGPUGetDimensions( mgpu_weights );
-    size_t N_weights = dims[0];
-    size_t K = dims[1];
+    int N_weights = dims[0];
+    int K = dims[1];
     if (N_weights != N)
         mexErrMsgIdAndTxt(errId, "weights must be a [N x K] gpuArray");
     // k (weight index) = input 2
@@ -531,7 +504,7 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[])
         mexErrMsgIdAndTxt(errId, "k is out of bounds");
     
     // Allocate memory for the output
-    std::vector<size_t> dims_C = {D, D};
+    std::vector<size_t> dims_C = {(size_t) D, (size_t) D};
     mxGPUArray *mgpu_C = mxGPUCreateGPUArray(2, dims_C.data(), 
             numericType, mxREAL, MX_GPU_DO_NOT_INITIALIZE);
     mxGPUArrayCleanupWrapper cleanup_C(mgpu_C);
