@@ -52,6 +52,7 @@ compile_opts = strrep(compile_opts,'-ansi,','');
 % Compiler/linker options
 mexcuda_opts = {
     '-lcublas'                      % Link to cuBLAS
+    '-lmwlapack'                    % Link to LAPACK
     ['NVCCFLAGS="' nvcc_opts '"']
     ['CXXFLAGS="--compiler-options=' compile_opts '"']
     '-L/usr/local/cuda/lib64'       % Location of CUDA libraries

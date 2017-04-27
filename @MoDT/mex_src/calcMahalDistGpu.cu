@@ -9,13 +9,16 @@
  *   X       [D x N] data matrix (gpuArray)
  * 
  * L and X may be single- or double-precision, but they must be the same type.
- * There may be some issues if X contains more than 2 billion (2^31) elements.
  * 
- * For D <= 28, this uses a custom CUDA kernel that multiplies the matrices and
+ * For small D, this uses a custom CUDA kernel that multiplies the matrices and
  * computes the squared norm, without requiring intermediate storage.
- * For D > 28, we use cublasDtrsm and have a custom kernel for the squared norm.
+ * For large D, we compute the explicit inverse on the CPU, perform GEMM on the
+ * GPU, and then square and sum across columns using a custom kernel.
  *
- * Kevin Shan, 2016-06-16
+ * Kevin Shan
+ * 2017-04-27  Switch from TRSM to explicit inverse 
+ * 2017-04-26  Add single-precision support
+ * 2016-06-16  Initial version
  *============================================================================*/
 
 #ifdef MATLAB_MEX_FILE
@@ -24,6 +27,8 @@
 #else
     #include <unistd.h>
 #endif
+
+#include "lapack.h"
 
 #include <cuda_runtime.h>
 #include "cublas_v2.h"
@@ -37,34 +42,30 @@
 #include <memory>
 #include <vector>
 
-/* Overload the __shfl() intrinsics for double-precision data
- * Damnit, there's undocumented versions of __shfl for double-precision
- * arguments, so I had to name these something else. Also, note that the __shfl
- * intrinsics were only introduced in compute capability 3.0 and higher.
+/* Shuffle operations for single- and double-precision. Unfortunately,
+ * I can't just call it __shfl() because there's an undocumented version
+ * of __shfl() for double-precision, and yet I'm having trouble linking
+ * to it.
  */
-#if __CUDA_ARCH__ >= 300
-__device__ double dblShfl(double var, int srcLane, int width=32)
-{
+__device__ double shfl(double var, int srcLane, int width=32) {
     int hi = __shfl( __double2hiint(var), srcLane, width );
     int lo = __shfl( __double2loint(var), srcLane, width );
     return __hiloint2double( hi, lo );
 }
 
-__device__ double dblShfl_down(double var, unsigned int delta, int width=32)
-{
+__device__ double shfl_down(double var, unsigned int delta, int width=32) {
     int hi = __shfl_down( __double2hiint(var), delta, width );
     int lo = __shfl_down( __double2loint(var), delta, width );
     return __hiloint2double( hi, lo );
 }
 
-/* And then we added single-precision support, but I don't want to rename all
- * the function calls just yet, so now we have dblShfl overloaded for float. */
-__device__ double dblShfl(float var, int srcLane, int width=32)
-{   return __shfl( var, srcLane, width );   }
+__device__ float shfl(float var, int srcLane, int width=32) {
+   return __shfl( var, srcLane, width );
+}
 
-__device__ double dblShfl_down(float var, unsigned int delta, int width=32)
-{   return __shfl_down(var, delta, width);  }
-#endif
+__device__ float shfl_down(float var, unsigned int delta, int width=32) {
+    return __shfl_down(var, delta, width);
+}
 
 
 /* Simple wrapper classes so we can do RAII-style cleanup 
@@ -96,310 +97,131 @@ struct CudaDeleter {
  * The triSolveNorm kernel is kinda complicated: there are many different things
  * that need to be done on each iteration.
  *
- * For a D=12 triangular solve, there are 6 [4 x 4] sub-blocks of L, and on each
- * iteration we have 3 loads from global memory (LD), 3 triangular solves (TS), 
- * and 3 matrix multiplications (MM). We also need 6 no-ops for proper
- * synchronization and broadcasting of intermediate results, which brings the
- * memory requirement up to 15 [4 x 8] workspcaes. Here is a diagram (no-ops are
- * labeled with the node #, which is numbered consecutively across rows):
- *
- * LD_0 -> TS_00 -> [ 2 ]
- *                    |
- * LD_1 -> [ 4 ] -> MM_10 -> TS_11 -> [ 7 ]
- *                    |                 |
- * LD_2 -> [ 9 ] -> MM_20 -> [ 11] -> MM_21 -> TS_22 -> [ 14]
- *
- * On each loop iteration, each node performs its specified operation, then
- * shifts its workspace one node to the right. The last no-op node on each row 
- * contains the solution to L\X. Vertical lines indicate dependencies; e.g.
- * MM_10 and MM_20 both read from node 2.
- *
- * Note that each row has a different latency: row 0 has a latency of 2 (i.e.
- * node 2 contains L\X for the sub-block of X loaded 2 cycles ago), whereas
- * row 1 has a latency of 4, etc. When squaring and summing across rows, we need
- * to make sure that we account for this latency:
- *
- * -> TS_00 -> [ 2 ]
- *               |   -> TS_11 -> [ 7 ]
- *               |                 |   -> TS_22 -> [ 14]
- *               |                 |                 |
- *             ACC_1 -> [ 16] -> ACC_2 -> [ 18] -> ACC_3
+ * For a D=16 triangular solve, there are 10 [4 x 4] sub-blocks of L, and on each
+ * iteration we have 4 loads from global memory (LD), 4 triangular solves (TS), 
+ * and 6 matrix multiplications (MM).
  * 
- * The accumulators (ACC) compute the squared sum over the 4 rows of the input
- * node's [4 x 8] memory block. Hence this last row of ACC nodes requires only
- * [8 x 1] memory per node. The final ACC node also writes to global memory.
+ * LD_0 TS_00  |              |             |             |
+ * LD_1        | MM_10 TS_11  |             |             |
+ * LD_2        | MM_20        | MM_21 TS_22 |             |
+ * LD_3        | MM_30        | MM_31       | MM_32 TS_33 | 
+ *
+ * Each operation acts on a [4 x 8] workspace, and the vertical lines indicate 
+ * syncthreads() barriers. After performing the triangular solve, we need to 
+ * square and sum across columns.
  */
-__device__ void tsn_Load(int x, int y, int tIdx, double * W, 
-        int D, int N, int xOffset, int yOffset, 
-        double const * __restrict__ X) {
+
+template <typename numeric_t>
+__device__ void tsn_Load(int x, int y, int tIdx, numeric_t &val,
+        numeric_t *W, numeric_t const *X, int D, int N, int xOffset) {
     // Load a [4 x 8] block of X into W, padding with zeroes
     int xRead = x + xOffset;
-    int yRead = y + yOffset;
-    W[tIdx] = ((xRead<D)&&(yRead<N)) ? X[xRead+D*yRead] : 0;
+    val = ((xRead<D)&&(y<N)) ? X[xRead+D*y] : 0;
+    W[tIdx] = val;
 }
-__device__ void tsn_TriSolve(int x, int y, int tIdx, double volatile *W, 
-        double const *L) {
-#if __CUDA_ARCH__ >= 300
+
+template <typename numeric_t>
+__device__ void tsn_TriSolve(int x, int y, int tIdx, numeric_t &val,
+        numeric_t volatile *W, numeric_t const *L) {
     // Triangular solve with unit-diagonal [4 x 4] L and [4 x 8] W
-    double val = W[tIdx];
-    double coeff = L[tIdx%16];
+    // Assume val = W[tIdx];
+    numeric_t coeff = L[tIdx%16];
     for (int ii=0; ii<4-1; ii++) {
         // if (x>ii) W[x,y] -= L[x,ii] * W[ii,y];
-        double adjustment = dblShfl(coeff,x+ii*4,16) * dblShfl(val,ii,4);
+        // But we need to keep the shfl() outside the conditional
+        numeric_t adjustment = shfl(coeff,x+ii*4,16) * shfl(val,ii,4);
         if (x>ii) val -= adjustment;
     }
     // Apply scaling (produced when we unit-diagonalized L)
-    W[tIdx] = val * dblShfl(coeff,5*x,16); // W[x,y] *= L[x,x];
-#else
-    for (int ii=0; ii<4-1; ii++)
-        if (x>ii) W[tIdx] -= L[x+ii*4] * W[ii+y*4];
-    W[tIdx] *= L[5*x];
-#endif
-}
-__device__ void tsn_MatMult(int x, int y, int tIdx, double *W, 
-        double const *L, double const *Y) {
-    // Matrix multiplication: W -= L * Y, where L is [4x4] and W,Y are [4x8]
-    double w_val = W[tIdx];
-#if __CUDA_ARCH__ >= 300
-    double y_val = Y[tIdx];
-    double coeff = L[tIdx%16];
-    for (int ii=0; ii<4; ii++) {
-        // W[x,y] -= L[x,ii] * Y[ii,y];
-        w_val -= dblShfl(coeff,x+ii*4,16) * dblShfl(y_val,ii,4);
-    }
-#else
-    for (int ii=0; ii<4; ii++)
-        w_val -= L[x+ii*4] * Y[ii+y*4];
-#endif
-    W[tIdx] = w_val;
-}
-__device__ void tsn_Acc(int x, int y, int tIdx, double const *W, 
-        double *acc) {
-    // Compute the squared norm for each column of the [4x8] matrix W
-    double val = W[tIdx];
-    val *= val;
-#if __CUDA_ARCH__ >= 300
-    val += dblShfl_down(val,2,4);
-    val += dblShfl_down(val,1,4);
-    // Write to output
-    if (x==0) acc[y] += val;
-#else
-    if (x==0) acc[y] += val;
-    if (x==1) acc[y] += val;
-    if (x==2) acc[y] += val;
-    if (x==3) acc[y] += val;
-#endif
+    val *= shfl(coeff,5*x,16); // W[x,y] *= L[x,x];
+    W[tIdx] = val;
 }
 
-/* There is a pretty intricate scheduling of what each warp is supposed to do in
- * each loop iteration. Rather than have each thread block figure this out on
- * its own, we'll plan it out on the host (CPU) in this KernelPlan class.
+template <typename numeric_t>
+__device__ void tsn_MatMult(int x, int y, int tIdx, numeric_t &val,
+        numeric_t *W, numeric_t const *L, numeric_t const *Y) {
+    // Matrix multiplication: W -= L * Y, where L is [4x4] and W,Y are [4x8]
+    val = W[tIdx];
+    numeric_t y_val = Y[tIdx];
+    numeric_t coeff = L[tIdx%16];
+    for (int ii=0; ii<4; ii++) {
+        // W[x,y] -= L[x,ii] * Y[ii,y];
+        val -= shfl(coeff,x+ii*4,16) * shfl(y_val,ii,4);
+    }
+    W[tIdx] = val;
+}
+
+
+/* Convert L into a blocked representation suitable for the triSolveNorm kernel
+ * 
+ * This copies L into 4 x 4 blocks in column-major order
+ * i.e. [00, 10, 20, 30, 11, 21, 31, 22, 32, 33]
+ * But it also scales the diagonal blocks so that they are unit-diagonal, and
+ * the scaling factor is stored on the diagonal. 
  */
-struct __align__(16) WarpTask {
-    enum Op : int {Load,TriSolve,MatMult,Acc} operation; // Operation to perform
-    int wkspIdx;        // Workspace index
-    int opArg1;         // (optional) second argument for this operation
-    int opArg2;         // (optional) third argument for this operation
-};
-class KernelPlan {
-public:
-    int R;                          // ceil(D/4)
-    int M;                          // R*(R+1)/2 = # of [4 x 4] sub-blocks of L
-    std::vector<double> L_blocks;   // [4 x 4 x M] with the sub-blocks of L
-    int nWksp;                      // # of [4 x 8] workspaces
-    int nAcc;                       // # of [8 x 1] norm accumulator vectors
-    std::vector<int> nextWksp;      // [nWksp] circularly-linked lists
-    int nTask;                      // # of tasks to perform every iteration
-    int latency;                    // Overall computation latency
-    int sharedMemPerBlock;          // Shared memory required (Bytes)
-    std::vector<WarpTask> taskList; // [nTask] list of WarpTasks to perform
-    KernelPlan(int, double const *);// Constructor
-    KernelPlan(int D, float const*) : KernelPlan(D, (double*) nullptr) {} // Dummy for template
-};
-/* KernelPlan constructor */
-KernelPlan::KernelPlan(int D, double const *L)
+template <typename numeric_t>
+std::vector<numeric_t> copyLToBlocks(int D, numeric_t const *L)
 {
-    // Basic dimensions
-    R = (D+3)/4; // ceil(D/4)
-    M = (R*(R+1))/2;
-    nWksp = 2*M+R;
-    nAcc = 2*R-1;
-    nTask = M+2*R;
-    latency = 2*R;
-    // Copy L into blocks, ordered [00, 10, 11, 20, 21, 22, ... ]
-    L_blocks.resize(4*4*M);
-    std::fill(L_blocks.begin(), L_blocks.end(), 0);
+    // Allocate and initialize to zeros
+    int M = (D+4-1)/4; // ceil(D/4)
+    std::vector<numeric_t> L_blocks(4*4*M*(M+1)/2, 0.0);
+    // Copy L into blocks
     int blockIdx = 0;
-    for (int block_i=0; block_i<R; block_i++) {
-        // Sub-diagonal blocks are a simple copy
-        for (int block_j=0; block_j<block_i; block_j++) {
-            for (int idx=0; idx<16; idx++) {
-                int tgt_idx = idx + blockIdx*16;
-                int src_i = (idx%4) + block_i*4;
-                int src_j = (idx/4) + block_j*4;
-                if ((src_i<D)&&(src_j<D)) L_blocks[tgt_idx] = L[src_i+src_j*D];
-            }
-            blockIdx++;
-        }
+    for (int block_j=0; block_j<M; block_j++) {
         // For blocks on the diagonal, scale so that it is unit-diagonal
         for (int jj=0; jj<4; jj++) {
             // Set the diagonal equal to the scaling
-            int src_j = jj + block_i*4;
+            int src_j = jj + 4*block_j;
             if (src_j>=D) continue;
-            double scaling = 1 / L[src_j+src_j*D];
-            L_blocks[jj+jj*4+blockIdx*16] = scaling;
+            double scaling = 1 / L[src_j+D*src_j];
+            L_blocks[jj + 4*jj + 4*4*blockIdx] = scaling;
             // Scale the rest of that column
             for (int ii=jj+1; ii<4; ii++) {
-                int src_i = ii + block_i*4;
-                int tgt_idx = ii + jj*4 + blockIdx*16;
-                if (src_i<D) L_blocks[tgt_idx] = scaling*L[src_i+src_j*D];
+                int src_i = ii + 4*block_j;
+                int tgt_idx = ii + 4*jj + 4*4*blockIdx;
+                if (src_i<D)
+                    L_blocks[tgt_idx] = scaling * L[src_i + D*src_j];
             }
         }
         blockIdx++;
-    }
-    // Set up the circular buffers for the [4 x 8] workspaces
-    /* If a node is operating on workspace ii this loop iteration, it should
-     * operate on workspace nextWksp[ii] the next loop iteration. */
-    nextWksp.resize(nWksp);
-    for (int ii=0; ii<R; ii++) {
-        int rowStart = ii*(ii+2);
-        int rowEnd = rowStart + 2*ii + 2;
-        nextWksp[rowStart] = rowEnd;
-        for (int idx=rowStart; idx < rowEnd; idx++)
-            nextWksp[idx+1] = idx;
-    }
-    // Initialize the WarpTasks
-    taskList.resize(nTask);
-    int taskIdx = 0;
-    for (int ii=0; ii<R; ii++) {                // Loads from global memory
-        taskList[taskIdx].operation = WarpTask::Load;
-        taskList[taskIdx].wkspIdx = ii*(ii+2);      // First wksp in the row
-        taskList[taskIdx].opArg1 = 4*ii;            // xOffset argument
-        taskIdx++;
-    }
-    for (int ii=0; ii<R; ii++) {                // Squared-norm accumulators
-        taskList[taskIdx].operation = WarpTask::Acc;
-        taskList[taskIdx].wkspIdx = ii*(ii+4)+2;    // Last wksp in the row
-        taskList[taskIdx].opArg1 = 2*ii;            // normAccum index
-        taskList[taskIdx].opArg2 = ii;              // row # this operates on
-        taskIdx++;
-    }
-    for (int ii=0; ii<R; ii++) {                // Triangular solves
-        taskList[taskIdx].operation = WarpTask::TriSolve;
-        taskList[taskIdx].wkspIdx = ii*(ii+4)+1;    // 2nd-to-last wksp in row
-        taskList[taskIdx].opArg1 = (ii*(ii+3))/2;   // L_block index for (ii,ii)
-        taskIdx++;
-    }
-    for (int jj=0; jj<R; jj++) {                // Matrix multiplication
-        int yIdx = jj*(jj+4)+2;                     // Last wksp in row jj
-        for (int ii=jj+1; ii<R; ii++) {
-            taskList[taskIdx].operation = WarpTask::MatMult;
-            taskList[taskIdx].wkspIdx 
-                    = ii*(ii+2) + 2*jj + 2;         // wkspIdx for W argument
-            taskList[taskIdx].opArg1 
-                    = (ii*(ii+1))/2 + jj;           // L_block index for (ii,jj)
-            taskList[taskIdx].opArg2 = yIdx;        // wkspIdx for Y argument
-            taskIdx++;
+        // Sub-diagonal blocks are a simple copy
+        for (int block_i=block_j+1; block_i<M; block_i++) {
+            for (int jj=0; jj<4; jj++) {
+                int src_j = jj + 4*block_j;
+                if (src_j>=D) continue;
+                for (int ii=0; ii<4; ii++) {
+                    int src_i = ii + 4*block_i;
+                    int tgt_idx = ii + 4*jj + 4*4*blockIdx;
+                    if (src_i<D)
+                        L_blocks[tgt_idx] = L[src_i + D*src_j];
+                }
+            }
+            blockIdx++;
         }
     }
-    // Shared memory required
-    sharedMemPerBlock = 
-            nWksp*4*8*sizeof(double)        // Workspaces
-            + nAcc*8*sizeof(double)         // normAccums
-            + M*4*4*sizeof(double)          // L_blocks
-            + nTask*sizeof(WarpTask)        // taskList
-            + nWksp*sizeof(int);            // nextWksp
+    return L_blocks;
 }
-/* Ultimately, the kernel will need to access this KernelPlan object. So here
- * are some wrappers etc to move the KernelPlan onto the GPU device.
- */
-struct KernelPlanOnDevice {
-    int R;
-    int M;
-    double *L_blocks;   // Pointer to device memory
-    int nWksp;
-    int nAcc;
-    int *nextWksp;      // Pointer to device memory
-    int nTask;
-    int latency;
-    WarpTask *taskList; // Pointer to device memory
-};
-class KernelPlanDeviceWrapper {
-public:
-    KernelPlanDeviceWrapper(KernelPlan const&);
-    KernelPlanOnDevice *get_ptr(void) { return d_kpod.get(); }
-private:
-    std::unique_ptr<KernelPlanOnDevice,CudaDeleter> d_kpod;
-    std::unique_ptr<double,CudaDeleter> L_blocks;
-    std::unique_ptr<int,CudaDeleter> nextWksp;
-    std::unique_ptr<WarpTask,CudaDeleter> taskList;
-};
 
-/* Constructor/destructor for wrapper class that copies KernelPlan to device */
-KernelPlanDeviceWrapper::KernelPlanDeviceWrapper(KernelPlan const& src)
-{
-    // Start by making a KernelPlanOnDevice struct in host memory
-    KernelPlanOnDevice kpod;
-    // Copy fields
-    kpod.R = src.R;
-    kpod.M = src.M;
-    kpod.nWksp = src.nWksp;
-    kpod.nAcc = src.nAcc;
-    kpod.nTask = src.nTask;
-    kpod.latency = src.latency;
-    // Deep copy of arrays
-    size_t nBytes;
-    nBytes = 4*4*src.M*sizeof(*kpod.L_blocks);
-    cudaMalloc((void**)&kpod.L_blocks, nBytes);
-    L_blocks.reset(kpod.L_blocks);
-    cudaMemcpy(kpod.L_blocks,src.L_blocks.data(),nBytes,cudaMemcpyHostToDevice);
-    nBytes = src.nWksp*sizeof(*kpod.nextWksp);
-    cudaMalloc((void**)&kpod.nextWksp, nBytes);
-    nextWksp.reset(kpod.nextWksp);
-    cudaMemcpy(kpod.nextWksp,src.nextWksp.data(),nBytes,cudaMemcpyHostToDevice);
-    nBytes = src.nTask*sizeof(*kpod.taskList);
-    cudaMalloc((void**)&kpod.taskList, nBytes);
-    taskList.reset(kpod.taskList);
-    cudaMemcpy(kpod.taskList,src.taskList.data(),nBytes,cudaMemcpyHostToDevice);
-    // Make a device copy of the KernelPlanOnDevice struct
-    nBytes = sizeof(kpod);
-    KernelPlanOnDevice *d_kpod_copy;
-    cudaMalloc((void**)&d_kpod_copy, nBytes);
-    d_kpod.reset(d_kpod_copy);
-    cudaMemcpy(d_kpod.get(), &kpod, nBytes, cudaMemcpyHostToDevice);
-}
-/* Finally, the kernel will need to copy this KernelPlan into its shared memory.
- * This is not super trivial, so here is a separate function to do that.
+
+/* Shared memory layout
  */
-__device__ void tsn_LoadKernelPlan(KernelPlanOnDevice const *plan, int *S, 
-        dim3 const &threadIdx, dim3 const &blockDim, 
-        double * &workspaces, double * &normAccums, double * &L_blocks, 
-        int * &nextWksp, WarpTask * &taskList)
+template <typename numeric_t>
+__device__ void tsn_SetupSharedMem(int M, int nBanks, 
+        int* S, numeric_t const *L_global, 
+        numeric_t* &workspaces, numeric_t* &L_shared)
 {
-    int const M = plan->M;
-    int const nWksp = plan->nWksp;
-    int const nAcc = plan->nAcc;
-    int const nTask = plan->nTask;
-    // Lay out memory in order of descending alignment
+    // Lay out memory
     int offset = 0;
-    workspaces = (double*)&S[offset];   // 256 bytes
-    offset += nWksp * 4*8*sizeof(*workspaces)/sizeof(*S);
-    L_blocks = (double*)&S[offset];     // 128 bytes
-    offset += M * 4*4*sizeof(*L_blocks)/sizeof(*S);
-    normAccums = (double*)&S[offset];   // 64 bytes
-    offset += nAcc * 8*sizeof(*normAccums)/sizeof(*S);
-    taskList = (WarpTask*)&S[offset];   // 16 bytes
-    offset += nTask * sizeof(WarpTask)/sizeof(*S);
-    nextWksp = (int*)&S[offset];        // 4 bytes
-    // Initialize L_blocks, nextWksp, and taskList
-    int const tIdx = threadIdx.x + 32*threadIdx.y;
-    int const stride = 32*blockDim.y;
-    for (int ii=tIdx; ii<4*4*M; ii+=stride)
-        L_blocks[ii] = plan->L_blocks[ii];
-    for (int ii=tIdx; ii<nWksp; ii+=stride)
-        nextWksp[ii] = plan->nextWksp[ii];
-    for (int ii=tIdx; ii<nTask; ii+=stride)
-        taskList[ii] = plan->taskList[ii];
+    workspaces = reinterpret_cast<numeric_t*>(&S[offset]);
+    offset += 4*8 * M * nBanks * sizeof(numeric_t)/sizeof(*S);
+    L_shared = reinterpret_cast<numeric_t*>(&S[offset]);
+    int L_size = 4*4 * M*(M+1)/2;
+    // Read L into shared memory
+    int readOffset = threadIdx.x + 32*threadIdx.y;
+    int readStride = 32 * blockDim.y;
+    for (int ii=readOffset; ii<L_size; ii+=readStride)
+        L_shared[ii] = L_global[ii];
+    __syncthreads();
 }
 
 
@@ -408,121 +230,162 @@ __device__ void tsn_LoadKernelPlan(KernelPlanOnDevice const *plan, int *S,
  *
  * This expects:
  *   - 1-D block grid of any size
- *   - Thread block of size [32 x P]
- *   - Shared memory 
+ *   - Thread block of size [32 x nWarps]
+ *   - Shared memory for the following (M = ceil(D/4)):
+ *     - [4 x 4 x M*(M+1)/2] sub-blocks of L
+ *     - [4 x 8 x M x nBanks] workspaces
+ * 
+ * This processes 8*nBanks columns of X at a time. There are two versions of
+ * this kernel: synchronized and unsynchronized.
+ * 
+ * The unsynchronized version has no __syncthreads() barriers, so is
+ * potentially more efficient, but requires that nWarps == nBanks.
  *
- * This kernel uses a serial approach to processing the data:
- *   1. Data is loaded into shared memory in [D x 8] chunks
- *   2. A triangular solve is performed in-place, operating on one 4x4 sub-block
- *      of L at a time. This takes 2*R loop iterations due to the dependencies.
- *   3. The squared 2-norm is computed for each column.
- * This is pipelined so that we are loading new data on each loop iteration in
- * the kernel. Within a loop iteration, there are M+2*R independent tasks that
- * are distributed to the P warps of the thread block.
+ * The synchronized version has M __syncthreads() barriers per iteration, but
+ * can have an arbitrary relationship between nWarps and nBanks (this is only
+ * useful if nWarps > nBanks)
  *
  * Inputs:
  *   D          # of rows in X, and dimension of L
  *   N          # of columns in X
+ *   nBanks     # of banks of data to process in each block
  *   X          [D x N] data matrix
- *   plan       Pointer to KernelPlanOnDevice struct
+ *   L_blk      [4 x 4 x M*(M+1)/2] sub-blocks of L
  * Outputs:
  *   sqNorm     [N] output vector; y = sum((L\X).^2,1)
  */
-__global__ void triSolveNorm( int const D, int const N, 
-        double const * __restrict__ X, KernelPlanOnDevice const * plan, 
-        double * sqNorm )
+template <typename numeric_t>
+__global__ void triSolveNorm_unsynchronized( int D, int N,
+        numeric_t const *X, numeric_t const *L_blk, numeric_t *sqNorm)
 {
-    extern __shared__ int S[];
-    // Arrange the shared memory and load the kernel plan into shared memory
-    double *workspaces, *normAccums, *L_blocks;
-    int *nextWksp;
-    WarpTask *taskList;
-    tsn_LoadKernelPlan(plan, S, threadIdx, blockDim, 
-            workspaces, normAccums, L_blocks, nextWksp, taskList);
-    __syncthreads();
-    // Get some other dimensions etc
-    int const R = plan->R;
-    int const nAcc = plan->nAcc;
-    int const nTask = plan->nTask;
-    int const latency = plan->latency;
-    int const nWarp = blockDim.y;
+    int M = (D+4-1)/4;
+    int nBanks = blockDim.y; // Also = nWarps
+    // Set up the shared memory
+    extern __shared__ __align__(sizeof(int4)) int S[];
+    numeric_t *workspaces, *L_shared;
+    tsn_SetupSharedMem(M, nBanks, S, L_blk, workspaces, L_shared);
     // Get the identity of this thread
-    int const thread_idx = threadIdx.x;
-    int const thread_x = thread_idx % 4;
-    int const thread_y = thread_idx / 4;
-    int const warp_idx = threadIdx.y;
-    // Determine the number of iterations we will need to take
-    int readOffset = blockIdx.x * 8;
-    int readStride = gridDim.x * 8;
-    int nIter = (N-readOffset+readStride-1) / readStride;
-    nIter += latency;
+    int tIdx = threadIdx.x;
+    int tx = tIdx % 4;
+    int ty = tIdx / 4;
+    int bankIdx = threadIdx.y;
+    // Adjust the pointers based on the bank offset
+    int bankOffset = 8 * (bankIdx + nBanks * blockIdx.x);
+    N -= bankOffset;
+    sqNorm += bankOffset;
+    X += D*bankOffset;
+    workspaces += 4*8*M*bankIdx;
     // Grid stride through the data
-    for (int iter=0; iter<nIter; iter++) {
-        // For loop over the operations per iteration
-        for (int taskIdx=warp_idx; taskIdx<nTask; taskIdx+=nWarp) {
-            // Perform the specified operation
-            WarpTask *task = taskList + taskIdx;
-            int wkspIdx = task->wkspIdx;
-            double *W = workspaces + wkspIdx*32;
-            switch (task->operation) {
-                case WarpTask::Load : {
-                    int xOffset = task->opArg1;
-                    int yOffset = readOffset + iter*readStride;
-                    // Load from global memory
-                    tsn_Load(thread_x, thread_y, thread_idx, W, 
-                            D, N, xOffset, yOffset, X);
-                    break;
-                }
-                case WarpTask::TriSolve : {
-                    double const *L = L_blocks + task->opArg1*16;
-                    // Triangular solve
-                    tsn_TriSolve(thread_x, thread_y, thread_idx, W, L);
-                    break;
-                }
-                case WarpTask::MatMult : {
-                    double const *L = L_blocks + task->opArg1*16;
-                    int wkspIdx_Y = task->opArg2;
-                    double const *Y = workspaces + wkspIdx_Y*32;
-                    // Matrix multiplication
-                    tsn_MatMult(thread_x, thread_y, thread_idx, W, L, Y);
-                    // Increment the Y workspace pointer
-                    if (thread_idx==0) task->opArg2 = nextWksp[wkspIdx_Y];
-                    break;
-                }
-                case WarpTask::Acc : {
-                    int accIdx = task->opArg1;
-                    int rowIdx = task->opArg2;
-                    double *acc = normAccums + accIdx*8;
-                    // Reset the accumulator
-                    if ((rowIdx==0) && (thread_idx<8))
-                        acc[thread_idx] = 0;
-                    // Accumulate squared norm
-                    tsn_Acc(thread_x, thread_y, thread_idx, W, acc);
-                    // Write to global memory if applicable
-                    if ((rowIdx==R-1) && (iter>=latency)) {
-                        int yOffset = readOffset + (iter-latency)*readStride;
-                        if ((thread_idx<N-yOffset) && (thread_idx<8))
-                            sqNorm[thread_idx+yOffset] = acc[thread_idx];
-                    }
-                    // Increment the norm accumulator pointer
-                    if (thread_idx==0)
-                        task->opArg1 = (accIdx==0) ? (nAcc-1) : (accIdx-1);
-                    break;
-                }
-            }
-            // Increment the workspace pointer
-            if (thread_idx==0) task->wkspIdx = nextWksp[wkspIdx];
+    int blockStride = 8 * nBanks * gridDim.x;
+    while (N > 0) {
+        numeric_t val;
+        // Load rows (ending with row 0)
+        for (int i=M-1; i>=0; i--)
+            tsn_Load(tx,ty,tIdx,val, workspaces+4*8*i, X,D,N, 4*i);
+        // Perform the solve, moving across the columns of L
+        int m = 0;
+        for (int j=0; j<M; j++) {
+            // Triangular solve for the diagonal element, assuming that it is
+            // currently loaded into <val>
+            numeric_t *Y = workspaces + 4*8*j;
+            tsn_TriSolve(tx,ty,tIdx,val, Y, L_shared+4*4*m);
+            // Matrix multiplications for the rest of the rows, ending with j+1
+            for (int i=M-1; i>j; i--)
+                tsn_MatMult(tx,ty,tIdx,val, workspaces+4*8*i, L_shared+4*4*(m+i-j), Y);
+            // Increment m
+            m += M-j;
         }
-        // Wait for all warps to finish before going to the next iteration
-        __syncthreads();
+        // Sum the squared elements across columns
+        val *= val;
+        for (int i=M-2; i>=0; i--)
+            val += workspaces[tIdx + 4*8*i] * workspaces[tIdx + 4*8*i];
+        // Reduce within the workspace and write to global memory
+        val += shfl_down(val,2,4);
+        val += shfl_down(val,1,4);
+        // After shfl_down, only tx==0 has a valid sum
+        if ((tx==0) && (ty < N))
+            sqNorm[ty] = val;
+        // Increment the pointers/counters
+        N -= blockStride;
+        sqNorm += blockStride;
+        X += D*blockStride;
     }
 }
 
-/* Dummy version of this because there is no static_if */
-__global__ void triSolveNorm( int const D, int const N, 
-        float const * __restrict__ X, KernelPlanOnDevice * plan, 
-        float * sqNorm )
+template <typename numeric_t>
+__global__ void triSolveNorm( int D, int N, int nBanks,
+        numeric_t const *X, numeric_t const *L_blk, numeric_t *sqNorm)
 {
+    int M = (D+4-1)/4;
+    // Set up the shared memory
+    extern __shared__ __align__(sizeof(int4)) int S[];
+    numeric_t *workspaces, *L_shared;
+    tsn_SetupSharedMem(M, nBanks, S, L_blk, workspaces, L_shared);
+    // Get the identity of this thread
+    int tIdx = threadIdx.x;
+    int tx = tIdx % 4;
+    int ty = tIdx / 4;
+    int nWarps = blockDim.y;
+    int warpIdx = threadIdx.y;
+    // Adjust the pointers based on the block offset
+    int blockOffset = 8 * nBanks * blockIdx.x;
+    N -= blockOffset;
+    sqNorm += blockOffset;
+    X += D*blockOffset;
+    // Grid stride through the data
+    int blockStride = 8 * nBanks * gridDim.x;
+    while (N > 0) {
+        // Load
+        for (int opIdx = warpIdx; opIdx < M*nBanks; opIdx += nWarps) {
+            int bankIdx = opIdx % nBanks;
+            int ii = opIdx / nBanks;
+            numeric_t val;
+            numeric_t *W = workspaces + 4*8*(ii+M*bankIdx);
+            tsn_Load(tx,ty,tIdx,val, W, X+D*8*bankIdx, D, N, 4*ii);
+            // Perform triangular solve
+            if (ii==0)
+                tsn_TriSolve(tx,ty,tIdx,val, W, L_shared);
+        }
+        __syncthreads();
+        // Perform the solve, moving across the columns of L
+        int m = 0;
+        for (int jj=0; jj<M-1; jj++) {
+            for (int opIdx = warpIdx; opIdx < (M-jj-1)*nBanks; opIdx += nWarps) {
+                int bankIdx = opIdx % nBanks;
+                int increment = (opIdx / nBanks) + 1;
+                int ii = jj + increment;
+                // Matrix multiplication
+                numeric_t val;
+                numeric_t *Y = workspaces + 4*8*(jj + M*bankIdx);
+                numeric_t *W = workspaces + 4*8*(ii + M*bankIdx);
+                tsn_MatMult(tx,ty,tIdx,val, W, L_shared+4*4*(m+increment), Y);
+                // Triangular solve
+                if (increment == 1)
+                    tsn_TriSolve(tx,ty,tIdx,val, W, L_shared+4*4*(m+M-jj));
+            }
+            __syncthreads();
+            m += M-jj;
+        }
+        // Sum the squared elements and write to global memory
+        if (warpIdx < nBanks) {
+            // Square and sum across workspaces
+            numeric_t val = 0;
+            int bankIdx = warpIdx;
+            numeric_t *W_bank = workspaces + 4*8*M*bankIdx;
+            for (int ii=0; ii<M; ii++)
+                val += W_bank[tIdx+4*8*ii] * W_bank[tIdx+4*8*ii];
+            // Reduce within the workspace and write to global memory
+            val += shfl_down(val,2,4);
+            val += shfl_down(val,1,4);
+            // After shfl_down, only tx==0 has a valid sum
+            if ((tx==0) && (ty+8*bankIdx<N))
+                sqNorm[ty+8*bankIdx] = val;
+        }
+        // Increment the pointers/counters
+        N -= blockStride;
+        sqNorm += blockStride;
+        X += D*blockStride;
+    }
 }
 
 
@@ -542,45 +405,37 @@ __global__ void triSolveNorm( int const D, int const N,
  */
 int const sumSqCols_blockDim_y = 16; // Easier if known at compile time
 template <typename numeric_t>
-__global__ void sumSqCols( int const D, int const N, 
+__global__ void sumSqCols( int D, int N, 
         numeric_t const * __restrict__ A, numeric_t * b )
 {
     // Shared memory helps us coalesce the writes
-    #if __CUDA_ARCH__ >= 300
     __shared__ numeric_t S[sumSqCols_blockDim_y];
-    #else
-    __shared__ numeric_t S[sumSqCols_blockDim_y*33];
-    numeric_t volatile * S_sum = S + (threadIdx.y+1)*32;
-    #endif
     // Some dimension-related constants
-    int const linearIdx = threadIdx.x + threadIdx.y*blockDim.x;
-    int const P = sumSqCols_blockDim_y;
-    int const D_eff = ((D+31)/32) * 32; // Round up to next multiple of 32
+    int linearIdx = threadIdx.x + threadIdx.y*blockDim.x;
+    int P = sumSqCols_blockDim_y;
+    int D_eff = ((D+31)/32) * 32; // Round up to next multiple of 32
+    // Shift the start 
+    int readOffset = blockIdx.x * P;
+    N -= readOffset;
+    b += readOffset;
+    A += D*readOffset;
     // Grid-stride loop over the columns
-    int const yStart = blockIdx.x * P;
-    int const yStride = gridDim.x * P;
-    for (int readOffset=yStart; readOffset<N; readOffset+=yStride) {
+    int yStride = gridDim.x * P;
+    while (N > 0) {
         // Compute the sum over this column
         numeric_t running_sum = 0;
-        int readIdx_y = threadIdx.y + readOffset;
+        int readIdx_y = threadIdx.y;
         if (readIdx_y < N) {
             // For loop over the rows, 32 at a time
             /* No need to synchronize because each y belongs to a single warp */
             for (int readIdx_x=threadIdx.x; readIdx_x<D_eff; readIdx_x+=32) {
                 // Read and square the data
                 numeric_t value;
-                value = (readIdx_x<D) ? A[readIdx_x+readIdx_y*D] : 0;
+                value = (readIdx_x<D) ? A[readIdx_x+D*readIdx_y] : 0;
                 value *= value;
                 // Reduce across rows, noting that they belong to the same warp
-                #if __CUDA_ARCH__ >= 300
                 for (int shflOffset=16; shflOffset>0; shflOffset/=2)
-                    value += dblShfl_down(value, shflOffset);
-                #else
-                S_sum[threadIdx.x] = value;
-                for (int shflOffset=16; shflOffset>0; shflOffset/=2)
-                    if (threadIdx.x<shflOffset)
-                        S_sum[threadIdx.x] += S_sum[threadIdx.x+shflOffset];
-                #endif
+                    value += shfl_down(value, shflOffset);
                 // Note that this value is only valid for threadIdx.x==0
                 running_sum += value;
             }
@@ -590,8 +445,12 @@ __global__ void sumSqCols( int const D, int const N,
         if (threadIdx.x==0)
             S[threadIdx.y] = running_sum;
         __syncthreads();
-        if ((linearIdx < P) && (readOffset+linearIdx<N))
-            b[readOffset+linearIdx] = S[linearIdx];
+        if ((linearIdx < P) && (linearIdx < N))
+            b[linearIdx] = S[linearIdx];
+        // Increment the pointers/counters
+        N -= yStride;
+        b += yStride;
+        A += D*yStride;
     }
 }
 
@@ -619,6 +478,107 @@ cublasStatus_t trsm(
         const float *alpha, const float *A, int lda, float *B, int ldb )
 {   return cublasStrsm(handle,side,uplo,trans,diag,m,n,alpha,A,lda,B,ldb); }
 
+cublasStatus_t gemm( 
+        cublasHandle_t handle, cublasOperation_t ta, cublasOperation_t tb,
+        int m, int n, int k, const double *alpha, 
+        const double *A, int lda, const double *B, int ldb, 
+        const double *beta, double *C, int ldc )
+{   return cublasDgemm(handle,ta,tb,m,n,k,alpha,A,lda,B,ldb,beta,C,ldc); }
+cublasStatus_t gemm( 
+        cublasHandle_t handle, cublasOperation_t ta, cublasOperation_t tb,
+        int m, int n, int k, const float *alpha, 
+        const float *A, int lda, const float *B, int ldb, 
+        const float *beta, float *C, int ldc )
+{   return cublasSgemm(handle,ta,tb,m,n,k,alpha,A,lda,B,ldb,beta,C,ldc); }
+
+void trtri(char *uplo, char *diag, ptrdiff_t *n, 
+        double *A, ptrdiff_t *lda, ptrdiff_t *info)
+{   return dtrtri(uplo,diag,n,A,lda,info); }
+void trtri(char *uplo, char *diag, ptrdiff_t *n, 
+        float *A, ptrdiff_t *lda, ptrdiff_t *info)
+{   return strtri(uplo,diag,n,A,lda,info); }
+
+
+/* Optimization of the kernel parameters
+ * 
+ * Inputs:
+ *    D         Number of feature space dimensions
+ *    N         Number of spikes
+ * Outputs:
+ *    nWarps    Number of warps (32 threads) per block
+ *    nBanks    Number of banks per block
+ *    nBlocks   Total number of blocks
+ */
+template <typename numeric_t>
+void optimizeKernelParams(int D, int N, int &nWarps, int &nBanks, int &nBlocks) {
+    int M = (D+4-1)/4; // ceil(D/4)
+    int L_size = M*(M+1)/2;
+    // Get some device info
+    int deviceNo;
+    cudaGetDevice(&deviceNo);
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, deviceNo);
+    
+    // Consider between 2..8 blocks per MP
+    std::vector<int> nBlocksArr(7);
+    std::iota(nBlocksArr.begin(), nBlocksArr.end(), 2);
+    // See how many banks per MP this corresponds to
+    int maxMem = prop.sharedMemPerMultiprocessor / sizeof(numeric_t);
+    std::vector<int> maxBanksTot(7);
+    std::transform(nBlocksArr.begin(), nBlocksArr.end(), maxBanksTot.begin(),
+            [maxMem,M,L_size](int nBlocks) { 
+                return ((maxMem/nBlocks - 4*4*L_size)/(4*8*M)) * nBlocks;
+            });
+
+    // Because of the overhead for storing the L matrix (incurred on each block),
+    // fewer blocks per MP means more banks total. If even the 2-block-per-MP
+    // case supports fewer than 16 banks total, then let's use BLAS.
+    // Also, always use BLAS for D >= 64
+    int maxWarpsTot = prop.maxThreadsPerMultiProcessor / 32;
+    if ((maxBanksTot[0] < 16) || (D >= 64)) {
+        nWarps = -1;
+        nBanks = -1;
+        nBlocks = 2*(maxWarpsTot/sumSqCols_blockDim_y)*prop.multiProcessorCount;
+        nBlocks = std::min(nBlocks, N/sumSqCols_blockDim_y + 1);
+        return;
+    }
+
+    // If any of these hit 75% utilization, run in one-warp-per-bank mode
+    int bankThresh = static_cast<int>(0.75 * maxWarpsTot);
+    int lastSuccess = -1;
+    for (int ii=0; ii<maxBanksTot.size(); ii++) {
+        if (maxBanksTot[ii] >= bankThresh)
+            lastSuccess = ii;
+    }
+    int blocksPerMP;
+    if (lastSuccess > 0) {
+        // One-warp-per-bank mode
+        blocksPerMP = nBlocksArr[lastSuccess];
+        nBanks = maxBanksTot[lastSuccess] / blocksPerMP;
+        nBanks = std::min(nBanks, maxWarpsTot/blocksPerMP);
+        nWarps = nBanks;
+    }
+    else {
+        // We have enough banks to run our kernel, but not enough to have one
+        // warp per bank. We want to maximize the number of banks, but we also
+        // have a preference for having more blocks (with fewer banks each).
+        lastSuccess = 0;
+        int nBanksTot = maxBanksTot[0];
+        for (int ii=1; ii<maxBanksTot.size(); ii++) {
+            if (maxBanksTot[ii] >= 0.9 * nBanksTot) {
+                lastSuccess = ii;
+                nBanksTot = maxBanksTot[ii];
+            }
+        }
+        blocksPerMP = nBlocksArr[lastSuccess];
+        nBanks = nBanksTot / blocksPerMP;
+        nWarps = maxWarpsTot / blocksPerMP;
+    }
+    nBlocks = 2 * blocksPerMP * prop.multiProcessorCount;
+    nBlocks = std::min(nBlocks, N/(8*nBanks) + 1);
+}
+
+
 /* Main routine for computing the Mahalanobis distance
  * 
  * Inputs:
@@ -630,37 +590,96 @@ cublasStatus_t trsm(
  *    d_delta   [N] squared Mahalanobis distances (on GPU device)
  */
 template <typename numeric_t>
-void computeMahalDist(size_t D, size_t N, 
+void computeMahalDist(int D, int N, 
         numeric_t const *L, numeric_t const *d_X, numeric_t *d_delta)
 {
     char const * const cudaErrId = "MoDT:calcMahalDistGpu:cudaError";
-    if ((D <= 28) && std::is_same<double,numeric_t>::value) {
-        /* We have a kernel that performs a triangular solve and computes the
-         * squared norm of each column, and it's optimized for small matrices */
-        // I should have thought more carefully about where to use ints...
-        if (D*N > std::numeric_limits<int>::max())
-            mexErrMsgIdAndTxt("MoDT:calcMahalDistGpu:InvalidInput",
-                    "Large arrays (> 2^31 elements) not currently supported");
-        // Create an execution plan for the kernel and transfer it to the device
-        KernelPlan plan(D, L);
-        KernelPlanDeviceWrapper kpdWrapper(plan);
-        // Determine how many warps we can allocate per block
-        int sharedMemPerBlock = plan.sharedMemPerBlock;
-        int blocksPerMP = std::min(16, (48*1024)/sharedMemPerBlock);
-        int warpsPerBlock = std::min(32, 51/blocksPerMP);
-        dim3 threadsPerBlock(32, warpsPerBlock);
-        // Determine how many blocks to launch
-        int colsPerBlock = 64 * plan.latency;
-        int numBlocks = std::min(8*blocksPerMP, (int)(N/colsPerBlock)+1);
-        // Launch our kernel
-        triSolveNorm<<<numBlocks,threadsPerBlock,sharedMemPerBlock>>>
-                (D, N, d_X, kpdWrapper.get_ptr(), d_delta);
-        // Wait for it to finish before we let kpdWrapper go out of scope
-        cudaDeviceSynchronize();
-    } 
+    // Determine parameters for our kernel
+    int nWarps, nBanks, nBlocks;
+    optimizeKernelParams<numeric_t>(D, N, nWarps, nBanks, nBlocks);
+
+    if (nWarps > 0) {
+        // Use our kernel
+        // Copy L into blocks
+        std::vector<numeric_t> L_blocks = copyLToBlocks(D, L);
+        // Copy this to the device
+        numeric_t *d_L;
+        cudaError_t cudaStat;
+        int M = (D+4-1)/4;
+        int L_size = M*(M+1)/2;
+        cudaStat = cudaMalloc((void**) &d_L, 4*4*L_size * sizeof(*d_L));
+        std::unique_ptr<numeric_t,CudaDeleter> cleanup_L(d_L);
+        if (cudaStat != cudaSuccess)
+            mexErrMsgIdAndTxt(cudaErrId, "Failed to allocate CUDA memory for L");
+        cudaStat = cudaMemcpy(d_L, L_blocks.data(), 4*4*L_size * sizeof(*d_L), 
+                cudaMemcpyHostToDevice);
+        // Launch the kernel
+        dim3 tPerBlk(32,nWarps);
+        int shMemPerBlk = (4*4*L_size + 4*8*M*nBanks)*sizeof(*d_X);
+        if (nWarps==nBanks) {
+            triSolveNorm_unsynchronized<<<nBlocks, tPerBlk, shMemPerBlk>>>
+                    (D, N, d_X, d_L, d_delta);
+        }
+        else {
+            triSolveNorm<<<nBlocks, tPerBlk, shMemPerBlk>>>
+                    (D, N, nBanks, d_X, d_L, d_delta);
+        }
+        // Make sure it completes before we let the temp vars go out of scope
+        cudaStat = cudaDeviceSynchronize();
+        if (cudaStat != cudaSuccess)
+            mexErrMsgIdAndTxt(cudaErrId, cudaGetErrorString(cudaStat));
+    }
+    else if (D < 2048) {
+        // First, copy and invert L
+        std::vector<numeric_t> Linv(L, L+D*D);
+        char uplo = 'L';    // L is lower triangular
+        char diag = 'N';    // L is not unit triangular
+        ptrdiff_t D_64 = D;
+        ptrdiff_t info = 0;      // Status output for trtri
+        trtri(&uplo, &diag, &D_64, Linv.data(), &D_64, &info);
+        if (info != 0)
+            mexErrMsgIdAndTxt("MoDT:calcMahalDistGpu:LAPACKError", 
+                    "LAPACK routine ?trtri() exited with error");
+        // Initialize
+        cublasStatus_t cublasStat;
+        cudaError_t cudaStat;
+        cublasHandle_t handle;
+        cublasStat = cublasCreate(&handle);
+        cublasHandleCleanupWrapper cleanup_handle(handle);
+        if (cublasStat != CUBLAS_STATUS_SUCCESS)
+            mexErrMsgIdAndTxt(cudaErrId, "Unable to initialize cuBLAS context");
+        // Move Linv to the device
+        numeric_t *d_Linv;
+        cudaStat = cudaMalloc((void**)&d_Linv, D*D*sizeof(*d_Linv));
+        std::unique_ptr<numeric_t,CudaDeleter> cleanup_Linv(d_Linv);
+        if (cudaStat != cudaSuccess)
+            mexErrMsgIdAndTxt(cudaErrId, "Failed to allocate CUDA memory for Linv");
+        cublasStat = cublasSetMatrix(D,D,sizeof(*d_Linv), Linv.data(),D, d_Linv,D);
+        if (cublasStat != CUBLAS_STATUS_SUCCESS)
+            mexErrMsgIdAndTxt(cudaErrId, "cuBLAS error copying Linv to GPU");
+        // Allocate space for Y = Linv * X
+        numeric_t *d_Y;
+        cudaStat = cudaMalloc((void**)&d_Y, D*N*sizeof(*d_X));
+        std::unique_ptr<numeric_t,CudaDeleter> cleanup_Y(d_Y);
+        if (cudaStat != cudaSuccess)
+            mexErrMsgIdAndTxt(cudaErrId, "Failed to allocate CUDA memory for Y");
+        // Call GEMM
+        numeric_t alpha = 1;
+        numeric_t beta = 0;
+        cublasStat = gemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                D, N, D, &alpha, d_Linv, D, d_X, D, &beta, d_Y, D);
+        if (cublasStat != CUBLAS_STATUS_SUCCESS)
+            mexErrMsgIdAndTxt(cudaErrId, "cuBLAS error during TRSM");
+        // Call our kernel for computing the squared norm
+        dim3 threadsPerBlock(32, sumSqCols_blockDim_y);
+        sumSqCols<<<nBlocks,threadsPerBlock>>>(D, N, d_Y, d_delta);
+        // Make sure it completes before we let the temp vars go out of scope
+        cudaStat = cudaDeviceSynchronize();
+        if (cudaStat != cudaSuccess)
+            mexErrMsgIdAndTxt(cudaErrId, cudaGetErrorString(cudaStat));
+    }
     else {
-        /* For larger D, our kernel runs out of shared memory, so use cuBLAS 
-         * Also, use cuBLAS for single precision */
+        // For very large D, use TRSM
         cublasStatus_t cublasStat;
         cudaError_t cudaStat;
         cublasHandle_t handle;
@@ -674,7 +693,7 @@ void computeMahalDist(size_t D, size_t N,
         cudaStat = cudaMalloc((void**)&d_L, D*D*sizeof(*L));
         std::unique_ptr<numeric_t,CudaDeleter> cleanup_L(d_L);
         if (cudaStat != cudaSuccess)
-            mexErrMsgIdAndTxt(cudaErrId, "Failed to allocate CUDA memory");
+            mexErrMsgIdAndTxt(cudaErrId, "Failed to allocate CUDA memory for L");
         cublasStat = cublasSetMatrix(D, D, sizeof(*L), L, D, d_L, D);
         if (cublasStat != CUBLAS_STATUS_SUCCESS)
             mexErrMsgIdAndTxt(cudaErrId, "cuBLAS error copying L to GPU");
@@ -683,7 +702,7 @@ void computeMahalDist(size_t D, size_t N,
         cudaStat = cudaMalloc((void**)&d_X_copy, D*N*sizeof(*d_X));
         std::unique_ptr<numeric_t,CudaDeleter> cleanup_X_copy(d_X_copy);
         if (cudaStat != cudaSuccess)
-            mexErrMsgIdAndTxt(cudaErrId, "Failed to allocate CUDA memory");
+            mexErrMsgIdAndTxt(cudaErrId, "Failed to allocate CUDA memory for X");
         cudaStat = cudaMemcpy(d_X_copy, d_X, D*N*sizeof(*d_X), 
                 cudaMemcpyDeviceToDevice);
         if (cudaStat != cudaSuccess)
@@ -697,8 +716,11 @@ void computeMahalDist(size_t D, size_t N,
             mexErrMsgIdAndTxt(cudaErrId, "cuBLAS error during TRSM");
         // Call our kernel for computing the squared norm
         dim3 threadsPerBlock(32, sumSqCols_blockDim_y);
-        int numBlocks = std::min(64, (int)(N/sumSqCols_blockDim_y)+1);
-        sumSqCols<<<numBlocks,threadsPerBlock>>>(D, N, d_X_copy, d_delta);
+        sumSqCols<<<nBlocks,threadsPerBlock>>>(D, N, d_X_copy, d_delta);
+        // Make sure it completes before we let the temp vars go out of scope
+        cudaStat = cudaDeviceSynchronize();
+        if (cudaStat != cudaSuccess)
+            mexErrMsgIdAndTxt(cudaErrId, cudaGetErrorString(cudaStat));
     }
 }
 
@@ -718,6 +740,7 @@ numeric_t * mxPtr(mxArray *mx_X)
 template <typename numeric_t>
 numeric_t const * mxPtr(mxArray const *mx_X)
 {   return static_cast<numeric_t const*>(mxGetData(mx_X)); }
+
 /* Main entry point into this mex file
  * Inputs and outputs are arrays of mxArray pointers
  */
@@ -731,7 +754,7 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[])
     mxArray const *mx_L = prhs[0];
     if (mxIsGPUArray(mx_L))
         mexErrMsgIdAndTxt(errId, "L should not be a gpuArray");
-    size_t D = mxGetM(mx_L);
+    int D = mxGetM(mx_L);
     mxClassID numericType = mxGetClassID(mx_L);
     if ((D==0) || (D!=mxGetN(mx_L)) || 
             !((numericType==mxDOUBLE_CLASS) || (numericType==mxSINGLE_CLASS)) )
@@ -749,10 +772,10 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[])
     size_t const *dims = mxGPUGetDimensions( mgpu_X );
     if (dims[0] != D)
         mexErrMsgIdAndTxt(errId, "X must be a [D x N] gpuArray");
-    size_t N = dims[1];
+    int N = dims[1];
     
     // Allocate memory for the output
-    std::vector<size_t> dims_delta = {N, 1};
+    std::vector<size_t> dims_delta = {(size_t) N, 1};
     mxGPUArray *mgpu_delta = mxGPUCreateGPUArray(2, dims_delta.data(),
             numericType, mxREAL, MX_GPU_DO_NOT_INITIALIZE);
     mxGPUArrayCleanupWrapper cleanup_delta(mgpu_delta);
@@ -796,7 +819,6 @@ void demo_mahalDist(ptrdiff_t D, ptrdiff_t N)
     computeMahalDist(D, N, h_L, d_X, d_delta);
 }    
 
-
 /* Main entry point if this is compiled externally (i.e. not as a MEX file)
  * This sets up and runs a simple example program and is suitable for benchmarking
  */
@@ -821,4 +843,3 @@ int main(int argc, char* argv[])
 }
 
 #endif
-
