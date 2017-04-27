@@ -39,24 +39,18 @@ fprintf('Finish compliing C++ code\n\n');
 
 % Compile the CUDA code
 fprintf('Compiling CUDA code...\n');
-% These are the options I copied from nvcc_g++.xml
+% Compiler/linker options
 nvcc_opts = [...
     '-gencode=arch=compute_30,code=sm_30 ' ...
     '-gencode=arch=compute_50,code=sm_50 ' ...
     '-gencode=arch=compute_60,code=sm_60 ' ...
     '-std=c++11' ...
     ];
-compile_opts = '-ansi,-fexceptions,-fPIC,-fno-omit-frame-pointer,-pthread';
-% Remove the -ansi option; it conflicts with -std=c++11
-compile_opts = strrep(compile_opts,'-ansi,','');
-% Compiler/linker options
 mexcuda_opts = {
     '-lcublas'                      % Link to cuBLAS
     '-lmwlapack'                    % Link to LAPACK
     ['NVCCFLAGS="' nvcc_opts '"']
-    ['CXXFLAGS="--compiler-options=' compile_opts '"']
     '-L/usr/local/cuda/lib64'       % Location of CUDA libraries
-    '-lc'                           % Weirdly, need to link to libc
     };
 % Compile, link, and move to the MoDT class directory
 for ii = 1:length(cuda_func_list)
