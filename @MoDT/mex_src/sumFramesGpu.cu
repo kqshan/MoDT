@@ -307,11 +307,11 @@ void computeFrameSums(int D, int N, int K, int T,
         cudaGetDeviceProperties(&prop, deviceNo);
         // Design for the worst-case scenario in terms of # frames per block
         int maxT_eff = 64; // I decided this
-        // Figure out how many clusters we can do and still have 2 blocks per MP
+        // Figure out how many clusters we can do and still have 3 blocks per MP
         int maxThreads = prop.maxThreadsPerMultiProcessor;
-        int maxK_thread = (maxThreads/2) / (D+1);
+        int maxK_thread = (maxThreads/3) / (D+1);
         int maxMem = prop.sharedMemPerMultiprocessor;
-        int maxK_mem = ((maxMem/2) - maxT_eff*sizeof(*d_fsLim))
+        int maxK_mem = ((maxMem/3) - maxT_eff*sizeof(*d_fsLim))
                        / (READ_BUFF_SZ*sizeof(numeric_t)) - D;
         int maxK = std::min(maxK_thread, maxK_mem);
         // If we can't do all of the clusters at once, try to spread them evenly
@@ -338,6 +338,13 @@ void computeFrameSums(int D, int N, int K, int T,
         // Launch the kernel
         sumFrames<<<blocksPerGrid, threadsPerBlock, memPerBlock>>>
                 (D, N, K, T, d_Y, d_wzu, d_fsLim, d_wzuY, d_sumwzu);
+        // Check for kernel launch errors
+        cudaStat = cudaGetLastError();
+        if (cudaStat != cudaSuccess) {
+            std::cout<<"kernel launch requested 32 x "<<nWarps<<" threads and ";
+            std::cout<<memPerBlock<<" mem per block."<<std::endl;
+            mexErrMsgIdAndTxt(cudaErrId, cudaGetErrorString(cudaStat));
+        }
         
     } else {
         /* For larger problems, we turn to cuBLAS */
