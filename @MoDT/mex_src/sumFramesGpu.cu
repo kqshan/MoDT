@@ -291,11 +291,11 @@ void computeFrameSums(int D, int N, int K, int T,
         
         // Copy the fsLim indices to the GPU
         int *d_fsLim;
-        cudaStat = cudaMalloc((void**)&d_fsLim, T*2*sizeof(d_fsLim));
+        cudaStat = cudaMalloc((void**)&d_fsLim, T*2*sizeof(*d_fsLim));
         std::unique_ptr<int,CudaDeleter> cleanup_fsLim(d_fsLim);
         if (cudaStat != cudaSuccess)
             mexErrMsgIdAndTxt(cudaErrId, "Failed to allocate CUDA memory");
-        cudaStat = cudaMemcpyAsync(d_fsLim, fsLim0.data(), T*2*sizeof(d_fsLim), 
+        cudaStat = cudaMemcpyAsync(d_fsLim, fsLim0.data(), T*2*sizeof(*d_fsLim), 
                 cudaMemcpyHostToDevice);
         if (cudaStat != cudaSuccess)
             mexErrMsgIdAndTxt(cudaErrId, "cuBLAS error copying to GPU");
@@ -311,8 +311,8 @@ void computeFrameSums(int D, int N, int K, int T,
         int maxThreads = prop.maxThreadsPerMultiProcessor;
         int maxK_thread = (maxThreads/2) / (D+1);
         int maxMem = prop.sharedMemPerMultiprocessor;
-        int maxK_mem = ((maxMem/2) - maxT_eff*sizeof(d_fsLim))
-                       / (READ_BUFF_SZ*sizeof(d_Y)) - D;
+        int maxK_mem = ((maxMem/2) - maxT_eff*sizeof(*d_fsLim))
+                       / (READ_BUFF_SZ*sizeof(numeric_t)) - D;
         int maxK = std::min(maxK_thread, maxK_mem);
         // If we can't do all of the clusters at once, try to spread them evenly
         int K_eff, grid_x;
@@ -326,8 +326,8 @@ void computeFrameSums(int D, int N, int K, int T,
         // This determines the threads per block and the memory usage
         int nWarps = (D*K_eff + K_eff + 31)/32;
         dim3 threadsPerBlock(32, nWarps);
-        int memPerBlock = (D+K_eff)*READ_BUFF_SZ*sizeof(d_Y) + 
-                maxT_eff*sizeof(d_fsLim);
+        int memPerBlock = (D+K_eff)*READ_BUFF_SZ*sizeof(numeric_t) + 
+                maxT_eff*sizeof(*d_fsLim);
         // Figure out how many blocks in the grid
         int blocksPerMP = std::min(maxThreads/(64*nWarps), maxMem/memPerBlock);
         int grid_y = 2 * prop.multiProcessorCount * blocksPerMP;

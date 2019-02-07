@@ -378,13 +378,13 @@ void computeWeightedCov(int D, int N,
     if (use_blas)
         optimizeBatches(D, N, 1, nBatches, batchSize);
     else
-        optimizeBatches(D, N, READ_BUFF_BYTES/sizeof(d_A), nBatches, batchSize);
+        optimizeBatches(D, N, READ_BUFF_BYTES/sizeof(*d_A), nBatches, batchSize);
     // Allocate memory for batches, if necessary
     numeric_t *d_CBatched;
     std::unique_ptr<numeric_t,CudaDeleter> cleanup_CBatched;
     if (nBatches > 1) {
         cudaStat = cudaMalloc((void**)&d_CBatched, 
-                static_cast<ptrdiff_t>(D)*D*nBatches*sizeof(d_A) );
+                static_cast<ptrdiff_t>(D)*D*nBatches*sizeof(*d_A) );
         if (cudaStat != cudaSuccess)
             mexErrMsgIdAndTxt(cudaErrId, "Failed to allocate CUDA memory for batch output");
         cleanup_CBatched = std::unique_ptr<numeric_t,CudaDeleter>{d_CBatched};
