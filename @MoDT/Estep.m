@@ -40,9 +40,8 @@ else
     % Mahalanobis distance is cached from the M-step
     delta = self.mahal_dist;
     for k = 1:K
-        logSqrtDetC(k) = det(self.C(:,:,k)); % Not logSqrt yet
+        logSqrtDetC(k) = sum(log(diag(chol(self.C(:,:,k))))) / 2;
     end
-    logSqrtDetC = log(logSqrtDetC) / 2;
 end
 
 % Calculate Z
