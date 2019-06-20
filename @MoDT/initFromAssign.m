@@ -27,26 +27,36 @@ D = self.D; N = self.N; T = self.T;
 errid = [errid_pfx ':BadAssign'];
 errmsg = ['"assign" must be an [N x K] matrix of soft assignments or ' ...
     'an [N x 1] vector of cluster IDs'];
-if isvector(assign)
+if isvector(assign) && ~all(assign==1)
     % Convert to an [N x K] matrix of posteriors
     assert(length(assign)==N, errid, errmsg);
     assert(all((assign==round(assign)) & (assign > 0)), errid, ...
         'assign: [N x 1] Cluster IDs must be positive integers');
     K_ = max(assign);
     assign = sparse(1:N, assign, 1, N, K_);
-    % No sparse gpuArray support yet
-    if self.use_gpu
-        assign = full(assign);
-    end
 else
     % Make sure these are legitimate posteriors
     assert(size(assign,1)==N, errid, errmsg);
-    all_nonneg = ~any(assign(:) < 0);
-    within_tol = abs(sum(assign,2) - 1) < 1e-6;
+    if issparse(assign)
+        [~,~,assign_nz] = find(assign);
+        all_nonneg = ~any(assign_nz < 0);
+    else
+        all_nonneg = ~any(assign(:) < 0);
+    end
+    within_tol = abs(full(sum(assign,2)) - 1) < 1e-6;
     assert(all_nonneg && all(within_tol), errid, ...
         'assign: [N x K] Soft-assignments must be nonnegative and sum to 1');
     K_ = size(assign,2);
 end
+% Sparse single or gpuArray operations are not fully supported by MATLAB
+if issparse(assign) && (self.use_gpu || strcmp(self.datatype,'single'))
+    assign = full(assign);
+end
+% Convert to gpuArray
+if self.use_gpu
+    assign = gpuArray(assign);
+end
+
 
 % Parse additional arguments
 ip = inputParser();
@@ -67,6 +77,7 @@ assert(all(sum(assign,1) >= prm.starveThresh), errid, ...
 wz = bsxfun(@times, assign, self.spk_w);
 sum_wz = sum(wz,1)';
 alpha = sum_wz / sum(sum_wz);
+if self.use_gpu, alpha = gather(alpha); end
 % Mean
 mu_static = bsxfun(@rdivide, self.spk_Y * wz, sum(wz,1)); % [D x K]
 mu_static = repmat(reshape(mu_static, [D 1 K_]), [1 T 1]);

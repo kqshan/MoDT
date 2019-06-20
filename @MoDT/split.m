@@ -96,8 +96,6 @@ elseif numel(prm.splitInit)==N
     S = max(split_assign);
     N_sub = numel(split_assign);
     Z = sparse((1:N_sub)',split_assign,1,N_sub,S);
-    % No sparse gpuArray support yet
-    if self.use_gpu, Z = full(Z); end
     
 elseif size(prm.splitInit,2)>1 && size(prm.splitInit,1)==N
     % [N x S] matrix of posterior likelihoods
@@ -114,7 +112,7 @@ end
 assert(S==prm.S || ismember('S',ip.UsingDefaults), 'MoDT:split:BadInit', ...
     'You specified S=%d, but splitInit had %d clusters', prm.S, S);
 % Check that the initialization is valid
-is_valid_init = all(sum(Z,1) >= minSpkPerCluster);
+is_valid_init = all(full(sum(Z,1)) >= minSpkPerCluster);
 if ~is_valid_init
     exitcode = -2;
     return
