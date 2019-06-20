@@ -59,6 +59,9 @@ end
 assert(ismember(datatype_,{'single','double'}), self.badValueErrId, ...
     'Datatype must be single- or double-precision floating point');
 
+% Cast w to the same datatype as Y
+w_ = cast(w_, datatype_);
+
 % (2) Assign values ------------------------------------------------------------
 
 % Clear caches
