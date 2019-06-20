@@ -73,7 +73,7 @@ for ii = 1:nValues
             Z = self.posterior;
             if self.use_gpu, Z = gather(Z); end
             [~,spk_clustId] = max(Z,[],2);
-            val = sparse(spk_clustId,1:self.N,1,self.K,self.N) * Z;
+            val = sparse(spk_clustId,1:self.N,1,self.K,self.N) * double(Z);
         case 'logLike'
             val = self.data_ll + self.prior_ll;
         case 'dataLogLike'
