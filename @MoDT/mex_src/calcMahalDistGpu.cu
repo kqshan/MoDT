@@ -521,7 +521,9 @@ void optimizeKernelParams(int D, int N, int &nWarps, int &nBanks, int &nBlocks) 
     
     // Consider between 2..8 blocks per MP
     std::vector<int> nBlocksArr(7);
-    std::iota(nBlocksArr.begin(), nBlocksArr.end(), 2);
+    int nBlkTemp = 2;
+    for (auto &elem : nBlocksArr)
+        elem = nBlkTemp++;
     // See how many banks per MP this corresponds to
     int maxMem = prop.sharedMemPerMultiprocessor / sizeof(numeric_t);
     std::vector<int> maxBanksTot(7);
