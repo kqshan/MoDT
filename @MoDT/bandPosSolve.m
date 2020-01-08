@@ -19,6 +19,7 @@ function x = bandPosSolve(A_bands, b)
 [p,N] = size(A_bands);
 
 % MATLAB doesn't support single-precision sparse yet (as of R2017a)
+was_single = isa(A_bands,'single') || isa(b,'single');
 A_bands = double(A_bands); b = double(b);
 
 % Call sparse() to construct A
@@ -32,7 +33,7 @@ A = sparse(i(mask), j(mask), A_bands(mask), N, N);
 x = A \ b;
 
 % Cast to single if A or b was single
-if isa(A_bands,'single') || isa(b,'single')
+if was_single
     x = single(x);
 end
 
