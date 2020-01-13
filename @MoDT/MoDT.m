@@ -73,6 +73,8 @@
 %   optimizeMu    - Solve the quadratic optimization for mu
 %   optimizeC     - Solve the optimization for C
 %   calcPriorLL   - Calculate the log-likelihood of the parameter prior
+
+% Public methods that most users don't need to know about
 %
 % MEX files for accelerating specific operations [Static]:
 %   weightCovGpu  - Compute A*diag(w)*A' (on GPU)
@@ -85,6 +87,9 @@
 %   checkMexFiles - Check whether MEX files exist for this platform
 %   buildMexFiles - Compile MEX files, overwriting them if they already exist
 %   validateMex   - Run unit tests on MEX files
+%
+% Class-level unit testing [Static]:
+%   mvt_rand      - Sample from a multivariate t-distribution
 
 
 
@@ -233,6 +238,9 @@ end
 methods (Static)
     % Create an MoDT object based on a struct created by saveobj()
     obj = loadobj(s); % Defined externally
+    
+    % Sample from a multivariate t-distribution
+    X = mvt_rand(C, df, N);
 end
 
 
