@@ -2,6 +2,8 @@
 
 Mixture of drifting t-distribution model for sorting spikes and measuring unit isolation
 
+Please also see [our publication](https://doi.org/10.1016/j.jneumeth.2017.06.017):
+
 Shan KQ, Lubenov EV, and Siapas AG (2017). Model-based spike sorting with a mixture of drifting t-distributions. *J Neurosci Methods* 288, 82-98.
 
 # What is this? #
@@ -56,14 +58,14 @@ These are set using the `setParams` method. If you change these, remember that y
 * `C_reg` Don't use this; use `max_cond` instead. The goal here is to ensure the scale matrices are numerically well-conditioned, and `max_cond` is just less invasive in how it achieves this.
 
 **Attached data:**
-These are set using the `attachData` method. This defines the spike data that we are fitting the model to when we call the `EM` method. Alternatively, you can attach a new set of data (without re-fitting the model) to evaluate what the model has to say about *that* data.
+These are set using the `attachData` method. This defines the spike data that we are fitting the model to when we call the `EM` method. You can also attach new data without refitting the model; this allows you to evaluate what the model has to say about *that* data.
 * `spk_Y` [*D* x *N*] spike feature vectors (in *D* dimensions) for *N* spikes.
 * `spk_t` [*N*] spike times. These are used to determine which time frame each spike belongs to, and all of these must fall within the range covered by `mu_t`. You can use whatever time units you like, as long as it's consistent with `mu_t`, but if you like other people telling you what to do, then use milliseconds, and make 0 the start of the recording.
 * `spk_w` [*N*] spike weights. We have found that you can get a pretty good model fit in a fraction of the time by using only a subset of your data for fitting. However, you will need to weight this subset in order to maintain consistency with the full dataset. Even if all the spikes are weighted equally, you still need to specify these weights because of the drift regularizer.
 
 **Other class properties:**
 These control certain aspects of the computations.
-* `max_cond` Maximum allowable condition number of the cluster scale matrices `C`. The scale matrices are inverted during the M-step, so they need to be numerically well-conditioned.
+* `max_cond` Maximum allowable condition number of the cluster scale matrices `C`. The scale matrices are inverted during the M-step, so they need to be numerically well-conditioned. This maintains this `max_cond` constraint during fitting by inflating the smallest singular values of the `C` matrix until they are at least `1/max_cond` times the largest singular value.
 * `use_gpu` Use GPU for computation, and store certain data matrices in GPU memory.
 * `use_mex` Use precompiled subroutines (a.k.a. MEX files) to accelerate certain computations.
 
@@ -162,6 +164,7 @@ MATLAB objects are great and all, but sometimes we want structs so that we can s
 ## GPU support ##
 
 If you can create `gpuArray` objects in MATLAB, then you should consider setting `use_gpu=true` because these computations can be up to 10x faster on the GPU.
+However, you'll probably need to use the MEX routines (see below) to realize the full speedup.
 
 Most of this increase is due to faster memory bandwidth, rather than increased computational power (FLOPS). The arithmetic intensity of these operations scales with *D*, and typical values of *D* are low enough that we are memory-bound instead of compute-bound.
 
